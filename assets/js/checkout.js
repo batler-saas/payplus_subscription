@@ -1,0 +1,1836 @@
+/* global wc_checkout_params */
+
+jQuery(function ($) {
+    // wc_checkout_params is required to continue, ensure the object exists
+    if (typeof wc_checkout_params === "undefined") {
+        return false;
+    }
+
+    let hostedIsMain = payplus_script_checkout.hostedFieldsIsMain;
+    let iframeAutoHeight = payplus_script_checkout.iframeAutoHeight;
+    let payPlusMain = "payment_method_payplus-payment-gateway";
+    let payPlusHosted = "payment_method_payplus-payment-gateway-hostedfields";
+    let inputPayPlus = payPlusHosted;
+    var $hostedDiv = jQuery("body > div.container.hostedFields");
+    let firstTime = true;
+
+    $.blockUI.defaults.overlayCSS.cursor = "default";
+    let hasSavedCCs = Object.keys(payplus_script_checkout.hasSavedTokens);
+
+    // Check if pp_iframe or pp_iframe_h exist on the page - hide hosted fields gateway if they don't
+    function checkAndHideHostedFieldsIfMissing() {
+        const ppIframeExists = jQuery('.pp_iframe').length > 0 || jQuery('.pp_iframe_h').length > 0 || jQuery('#pp_iframe').length > 0;
+        
+        if (!ppIframeExists) {
+            const $hostedFieldsGateway = jQuery('.payment_method_payplus-payment-gateway-hostedfields');
+            
+            if ($hostedFieldsGateway.length > 0) {
+                // If neither element exists, hide the hosted fields gateway
+                $hostedFieldsGateway.hide();
+                // Also hide the payment box if it exists
+                jQuery('.payment_box.payment_method_payplus-payment-gateway-hostedfields').hide();
+                
+                // If hosted fields was selected, switch to main PayPlus gateway
+                const $hostedInput = jQuery('input#payment_method_payplus-payment-gateway-hostedfields');
+                if ($hostedInput.is(':checked')) {
+                    jQuery('input#payment_method_payplus-payment-gateway').prop('checked', true).trigger('change');
+                }
+                // Also disable the input to prevent selection
+                $hostedInput.prop('disabled', true);
+            }
+        }
+    }
+
+    // Run check only at initial page load to detect mis-configured hosted fields
+    // (i.e. the gateway appears in the list but the payment UI was never rendered).
+    // Do NOT run this on updated_checkout: after a fragment refresh the hosted fields
+    // SDK hasn't re-initialised yet, so .pp_iframe_h is temporarily absent and the
+    // function would incorrectly hide the hosted-fields gateway list item.
+    checkAndHideHostedFieldsIfMissing();
+    setTimeout(checkAndHideHostedFieldsIfMissing, 100);
+    setTimeout(checkAndHideHostedFieldsIfMissing, 500);
+
+    // ── Iframe payment redirect: 2-layer approach ───────────────────────────
+    //
+    // The iframe has sandbox="...allow-top-navigation" so PayPlus's own
+    // redirectAfterTransaction can navigate the top window to the callback URL.
+    // Using unconditional allow-top-navigation (not -by-user-activation) avoids
+    // Chrome "Unsafe attempt" errors and Firefox "prevented redirect" prompts.
+    //
+    // Layer 1 (top-window navigation — primary):
+    //   PayPlus JS does window.top.location = callbackUrl after payment.
+    //   The callback URL loads in the top window; payplus_redirect_graceful
+    //   outputs a JS page that immediately does window.location.href = thankYouUrl.
+    //   The IPN/callback URL is visible in the address bar for ~50ms (JS execution
+    //   time) — imperceptible to users.
+    //
+    // Layer 2 (polling fallback — safety net):
+    //   PayPlus also sends a server-to-server IPN independent of the browser.
+    //   The parent polls /wp-admin/admin-ajax.php every 1.5s; as soon as the
+    //   order reaches processing/completed it redirects to the thank-you URL.
+    //   → Works if the browser redirect is blocked or the user closes the popup
+    //     before completion (in production with real IPN).
+    //
+    // postMessage listener (below) is an additional fast-path for cases where
+    // PayPlus navigates the iframe itself (not the top window) to the callback.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    var _payplusPollDone = false; // shared flag so postMessage can cancel polling
+    var _payplusPollTimerId = null;
+
+    function payplusRedirect(url) {
+        window.location.href = url;
+    }
+
+    // Layer 1: postMessage listener (fast-path)
+    // The IPN page (loaded inside the iframe) sends this message after processing.
+    // We validate the URL is same-origin before redirecting.
+    window.addEventListener('message', function(e) {
+        if (!e.data || e.data.type !== 'payplus_redirect' || !e.data.url) {
+            return;
+        }
+        try {
+            var u = new URL(e.data.url, window.location.origin);
+            if (u.origin === window.location.origin) {
+                _payplusPollDone = true;
+                payplusRedirect(e.data.url);
+            }
+        } catch (err) {
+            // ignore invalid URL
+        }
+    });
+
+    // Layer 2: polling fallback
+    function startOrderStatusPoll(result) {
+        if (!payplus_script_checkout.enableOrderStatusPoll) return;
+        if (!result || !result.order_id || !result.order_received_url) return;
+
+        // Clear any previous poll so we start fresh for this order
+        if (_payplusPollTimerId) {
+            clearInterval(_payplusPollTimerId);
+            _payplusPollTimerId = null;
+        }
+        _payplusPollDone = false;
+
+        var redirectUrl = result.order_received_url;
+        var orderKey = '';
+        try {
+            var u = new URL(redirectUrl, window.location.origin);
+            orderKey = u.searchParams.get('key') || '';
+        } catch (err) {
+            return;
+        }
+        if (!orderKey) return;
+
+        var pollCount = 0;
+        var maxPolls = 200; // ~5 min at 1.5s interval
+
+        function poll() {
+            if (_payplusPollDone) return;
+            pollCount++;
+            if (pollCount > maxPolls) return;
+
+            jQuery.ajax({
+                url: payplus_script_checkout.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'payplus_check_order_redirect',
+                    _ajax_nonce: payplus_script_checkout.frontNonce,
+                    order_id: result.order_id,
+                    order_key: orderKey,
+                },
+                dataType: 'json',
+                success: function(res) {
+                    if (_payplusPollDone) return;
+                    if (res && res.success && res.data && res.data.status) {
+                        var s = res.data.status;
+                        if (s === 'processing' || s === 'completed' || s === 'wc-processing' || s === 'wc-completed') {
+                            _payplusPollDone = true;
+                            payplusRedirect(res.data.redirect_url || redirectUrl);
+                        }
+                    }
+                },
+            });
+        }
+
+        // First poll immediately, then every 1.5s
+        poll();
+        _payplusPollTimerId = setInterval(function() {
+            if (_payplusPollDone) {
+                clearInterval(_payplusPollTimerId);
+                _payplusPollTimerId = null;
+                return;
+            }
+            poll();
+        }, 1500);
+    }
+
+    function stopOrderStatusPoll() {
+        _payplusPollDone = true;
+        if (_payplusPollTimerId) {
+            clearInterval(_payplusPollTimerId);
+            _payplusPollTimerId = null;
+        }
+    }
+
+    //function to hide other payment methods when subscription order
+    function subscriptionOrderHide() {
+        // Select all elements with the wc_payment_method class inside .wc_payment_methods.payment_methods.methods
+        $(
+            ".wc_payment_methods.payment_methods.methods .wc_payment_method"
+        ).each(function () {
+            // Check if the element has any class that starts with 'payment_method_payplus-payment-gateway-'
+            var classes = $(this).attr("class").split(/\s+/);
+            classes.forEach(
+                function (className) {
+                    if (payplus_script_checkout.isLoggedIn) {
+                        if (
+                            className.startsWith(
+                                "payment_method_payplus-payment-gateway-"
+                            ) &&
+                            className !==
+                            "payment_method_payplus-payment-gateway-hostedfields"
+                        ) {
+                            $(this).remove();
+                        }
+                    } else {
+                        if (
+                            className.startsWith(
+                                "payment_method_payplus-payment-gateway-"
+                            )
+                        ) {
+                            $(this).remove();
+                        }
+                    }
+                }.bind(this)
+            );
+        });
+    }
+
+    function hostedFieldsSetup() {
+        if (payplus_script_checkout.isHostedFields) {
+            // Check if pp_iframe or pp_iframe_h exist on the page
+            const ppIframeExists = jQuery('.pp_iframe').length > 0 || jQuery('.pp_iframe_h').length > 0;
+
+            if (!ppIframeExists) {
+                // If neither element exists, hide the hosted fields gateway
+                jQuery('.payment_method_payplus-payment-gateway-hostedfields').hide();
+                // If hosted fields was selected, switch to main PayPlus gateway
+                if (jQuery('input#payment_method_payplus-payment-gateway-hostedfields').is(':checked')) {
+                    jQuery('input#payment_method_payplus-payment-gateway').prop('checked', true).trigger('change');
+                }
+                return; // Exit if hosted fields cannot be displayed
+            }
+
+            if (firstTime) {
+                firstTime = false;
+                // Add save token checkbox to hosted fields container //
+                var $checkbox = $(
+                    '<p class="hf-save form-row">' +
+                    '<label for="save_token_checkbox">' +
+                    '<input type="checkbox" name="wc-save-token" id="save_token_checkbox" value="1" style="margin:0 10px 0 10px;"/>' +
+                    " " +
+                    payplus_script_checkout.saveCreditCard +
+                    "</label>" +
+                    "</p>"
+                );
+
+                payplus_script_checkout.isLoggedIn &&
+                    payplus_script_checkout.isSavingCerditCards
+                    ? $hostedDiv.append($checkbox)
+                    : null;
+
+                if (hostedIsMain) {
+                    setTimeout(function () {
+                        // Use .trigger('click') instead of .prop('checked') to fire WC's
+                        // payment_method_selected handler, which sets selectedPaymentMethod.
+                        // This ensures init_payment_methods can restore hosted-fields after
+                        // a fragment refresh (otherwise it falls back to the first method).
+                        $("input#" + inputPayPlus).trigger('click');
+                        $("div.container.hostedFields").show();
+                    }, 1000);
+                } else {
+                    setTimeout(function () {
+                        $(".payment_method_payplus-payment-gateway").css(
+                            "display",
+                            "block"
+                        );
+                        $("input#" + inputPayPlus).removeAttr("checked");
+                        $(".container.hostedFields").hide();
+                        $(
+                            ".payment_box.payment_method_payplus-payment-gateway-hostedfields"
+                        ).hide();
+                        const mainPayPlus =
+                            "payment_method_payplus-payment-gateway";
+                        $("input#" + mainPayPlus).trigger("click");
+                    }, 1000);
+                }
+            }
+            $(document).on(
+                "change",
+                'input[name="payment_method"]',
+                function () {
+                    // Check if the hosted fields radio input is NOT checked
+                    if (!$("input#" + inputPayPlus).is(":checked")) {
+                        $(".container.hostedFields").hide();
+                    } else {
+                        $("div.container.hostedFields").show();
+                    }
+                }
+            );
+        }
+    }
+
+    var wc_checkout_form = {
+        updateTimer: false,
+        dirtyInput: false,
+        selectedPaymentMethod: false,
+        xhr: false,
+        $order_review: $("#order_review"),
+        $checkout_form: $("form.checkout"),
+
+        init: function () {
+            $(document.body).on("update_checkout", this.update_checkout);
+            $(document.body).on("init_checkout", this.init_checkout);
+
+            // Payment methods
+            this.$checkout_form.on(
+                "click",
+                'input[name="payment_method"]',
+                this.payment_method_selected
+            );
+
+            if ($(document.body).hasClass("woocommerce-order-pay")) {
+                this.$order_review.on(
+                    "click",
+                    'input[name="payment_method"]',
+                    this.payment_method_selected
+                );
+                this.$order_review.on("submit", this.submitOrder);
+                this.$order_review.attr("novalidate", "novalidate");
+            }
+
+            // Prevent HTML5 validation which can conflict.
+            this.$checkout_form.attr("novalidate", "novalidate");
+
+            // Form submission
+            this.$checkout_form.on("submit", this.submit);
+
+            // Inline validation
+            this.$checkout_form.on(
+                "input validate change",
+                ".input-text, select, input:checkbox",
+                this.validate_field
+            );
+
+            // Manual trigger
+            this.$checkout_form.on("update", this.trigger_update_checkout);
+
+            // Inputs/selects which update totals
+            this.$checkout_form.on(
+                "change",
+                'select.shipping_method, input[name^="shipping_method"], #ship-to-different-address input, .update_totals_on_change select, .update_totals_on_change input[type="radio"], .update_totals_on_change input[type="checkbox"]',
+                this.trigger_update_checkout
+            ); // eslint-disable-line max-len
+            this.$checkout_form.on(
+                "change",
+                ".address-field select",
+                this.input_changed
+            );
+            this.$checkout_form.on(
+                "change",
+                ".address-field input.input-text, .update_totals_on_change input.input-text",
+                this.maybe_input_changed
+            ); // eslint-disable-line max-len
+            this.$checkout_form.on(
+                "keydown",
+                ".address-field input.input-text, .update_totals_on_change input.input-text",
+                this.queue_update_checkout
+            ); // eslint-disable-line max-len
+
+            // Address fields
+            this.$checkout_form.on(
+                "change",
+                "#ship-to-different-address input",
+                this.ship_to_different_address
+            );
+
+            // Trigger events
+            this.$checkout_form
+                .find("#ship-to-different-address input")
+                .trigger("change");
+            this.init_payment_methods();
+
+            // Update on page load
+            if (wc_checkout_params.is_checkout === "1") {
+                $(document.body).trigger("init_checkout");
+            }
+            if (wc_checkout_params.option_guest_checkout === "yes") {
+                $("input#createaccount")
+                    .on("change", this.toggle_create_account)
+                    .trigger("change");
+            }
+        },
+        init_payment_methods: function () {
+            var $payment_methods = $(".woocommerce-checkout").find(
+                'input[name="payment_method"]'
+            );
+
+            // If there is one method, we can hide the radio input
+            if (1 === $payment_methods.length) {
+                $payment_methods.eq(0).hide();
+            }
+
+            // If there was a previously selected method, check that one.
+            if (wc_checkout_form.selectedPaymentMethod) {
+                $("#" + wc_checkout_form.selectedPaymentMethod).prop(
+                    "checked",
+                    true
+                );
+            }
+
+            // If there are none selected, select the first.
+            if (0 === $payment_methods.filter(":checked").length) {
+                $payment_methods.eq(0).prop("checked", true);
+            }
+
+            // Get name of new selected method.
+            var checkedPaymentMethod = $payment_methods
+                .filter(":checked")
+                .eq(0)
+                .prop("id");
+
+            if ($payment_methods.length > 1) {
+                // Hide open descriptions (instant, no animation for testing)
+                $('div.payment_box:not(".' + checkedPaymentMethod + '")')
+                    .filter(":visible")
+                    .hide();
+            }
+
+            // Trigger click event for selected method
+            $payment_methods.filter(":checked").eq(0).trigger("click");
+        },
+        get_payment_method: function () {
+            return wc_checkout_form.$checkout_form
+                .find('input[name="payment_method"]:checked')
+                .val();
+        },
+        payment_method_selected: function (e) {
+            closePayplusIframe(true);
+            e.stopPropagation();
+
+            if ($(".payment_methods input.input-radio").length > 1) {
+                var target_payment_box = $(
+                    "div.payment_box." + $(this).attr("ID")
+                ),
+                    is_checked = $(this).is(":checked");
+
+                if (is_checked && !target_payment_box.is(":visible")) {
+                    // Use fadeOut/fadeIn for smooth transitions (CSS handles opacity)
+                    $("div.payment_box").filter(":visible").fadeOut(200);
+                    if (is_checked) {
+                        target_payment_box.fadeIn(200);
+                    }
+                }
+            }
+
+            if ($(this).data("order_button_text")) {
+                $("#place_order").text($(this).data("order_button_text"));
+            } else {
+                $("#place_order").text($("#place_order").data("value"));
+            }
+
+            var selectedPaymentMethod = $(
+                '.woocommerce-checkout input[name="payment_method"]:checked'
+            ).attr("id");
+
+            if (
+                selectedPaymentMethod !== wc_checkout_form.selectedPaymentMethod
+            ) {
+                $(document.body).trigger("payment_method_selected");
+                $(document.body).trigger("update_checkout", { update_shipping_method: false });
+            }
+
+            wc_checkout_form.selectedPaymentMethod = selectedPaymentMethod;
+        },
+        toggle_create_account: function () {
+            $("div.create-account").hide();
+
+            if ($(this).is(":checked")) {
+                // Ensure password is not pre-populated.
+                $("#account_password").val("").trigger("change");
+                $("div.create-account").slideDown();
+            }
+        },
+        init_checkout: function () {
+            $(document.body).trigger("update_checkout");
+        },
+        maybe_input_changed: function (e) {
+            if (wc_checkout_form.dirtyInput) {
+                wc_checkout_form.input_changed(e);
+            }
+        },
+        input_changed: function (e) {
+            wc_checkout_form.dirtyInput = e.target;
+            wc_checkout_form.maybe_update_checkout();
+        },
+        queue_update_checkout: function (e) {
+            var code = e.keyCode || e.which || 0;
+
+            if (code === 9) {
+                return true;
+            }
+
+            wc_checkout_form.dirtyInput = this;
+            wc_checkout_form.reset_update_checkout_timer();
+            wc_checkout_form.updateTimer = setTimeout(
+                wc_checkout_form.maybe_update_checkout,
+                "1000"
+            );
+        },
+        trigger_update_checkout: function () {
+            wc_checkout_form.reset_update_checkout_timer();
+            wc_checkout_form.dirtyInput = false;
+            $(document.body).trigger("update_checkout");
+        },
+        maybe_update_checkout: function () {
+            var update_totals = true;
+
+            if ($(wc_checkout_form.dirtyInput).length) {
+                var $required_inputs = $(wc_checkout_form.dirtyInput)
+                    .closest("div")
+                    .find(".address-field.validate-required");
+
+                if ($required_inputs.length) {
+                    $required_inputs.each(function () {
+                        if ($(this).find("input.input-text").val() === "") {
+                            update_totals = false;
+                        }
+                    });
+                }
+            }
+            if (update_totals) {
+                wc_checkout_form.trigger_update_checkout();
+            }
+        },
+        ship_to_different_address: function () {
+            $("div.shipping_address").hide();
+            if ($(this).is(":checked")) {
+                $("div.shipping_address").slideDown();
+            }
+        },
+        reset_update_checkout_timer: function () {
+            clearTimeout(wc_checkout_form.updateTimer);
+        },
+        is_valid_json: function (raw_json) {
+            try {
+                var json = JSON.parse(raw_json);
+
+                return json && "object" === typeof json;
+            } catch (e) {
+                return false;
+            }
+        },
+        validate_field: function (e) {
+            var $this = $(this),
+                $parent = $this.closest(".form-row"),
+                validated = true,
+                validate_required = $parent.is(".validate-required"),
+                validate_email = $parent.is(".validate-email"),
+                validate_phone = $parent.is(".validate-phone"),
+                pattern = "",
+                event_type = e.type;
+
+            if ("input" === event_type) {
+                $parent.removeClass(
+                    "woocommerce-invalid woocommerce-invalid-required-field woocommerce-invalid-email woocommerce-invalid-phone woocommerce-validated"
+                ); // eslint-disable-line max-len
+            }
+
+            if ("validate" === event_type || "change" === event_type) {
+                if (validate_required) {
+                    if (
+                        "checkbox" === $this.attr("type") &&
+                        !$this.is(":checked")
+                    ) {
+                        $parent
+                            .removeClass("woocommerce-validated")
+                            .addClass(
+                                "woocommerce-invalid woocommerce-invalid-required-field"
+                            );
+                        validated = false;
+                    } else if ($this.val() === "") {
+                        $parent
+                            .removeClass("woocommerce-validated")
+                            .addClass(
+                                "woocommerce-invalid woocommerce-invalid-required-field"
+                            );
+                        validated = false;
+                    }
+                }
+
+                if (validate_email) {
+                    if ($this.val()) {
+                        /* https://stackoverflow.com/questions/2855865/jquery-validate-e-mail-address-regex */
+                        pattern = new RegExp(
+                            /^([a-z\d!#$%&'*+\-\/=?^_`{|}~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]+(\.[a-z\d!#$%&'*+\-\/=?^_`{|}~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]+)*|"((([ \t]*\r\n)?[ \t]+)?([\x01-\x08\x0b\x0c\x0e-\x1f\x7f\x21\x23-\x5b\x5d-\x7e\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]|\\[\x01-\x09\x0b\x0c\x0d-\x7f\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]))*(([ \t]*\r\n)?[ \t]+)?")@(([a-z\d\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]|[a-z\d\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF][a-z\d\-._~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]*[a-z\d\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])\.)+([a-z\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]|[a-z\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF][a-z\d\-._~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]*[0-9a-z\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])\.?$/i
+                        ); // eslint-disable-line max-len
+
+                        if (!pattern.test($this.val())) {
+                            $parent
+                                .removeClass("woocommerce-validated")
+                                .addClass(
+                                    "woocommerce-invalid woocommerce-invalid-email woocommerce-invalid-phone"
+                                ); // eslint-disable-line max-len
+                            validated = false;
+                        }
+                    }
+                }
+
+                if (validate_phone) {
+                    pattern = new RegExp(/[\s\#0-9_\-\+\/\(\)\.]/g);
+
+                    if (0 < $this.val().replace(pattern, "").length) {
+                        $parent
+                            .removeClass("woocommerce-validated")
+                            .addClass(
+                                "woocommerce-invalid woocommerce-invalid-phone"
+                            );
+                        validated = false;
+                    }
+                }
+
+                if (validated) {
+                    $parent
+                        .removeClass(
+                            "woocommerce-invalid woocommerce-invalid-required-field woocommerce-invalid-email woocommerce-invalid-phone"
+                        )
+                        .addClass("woocommerce-validated"); // eslint-disable-line max-len
+                }
+            }
+        },
+        update_checkout: function (event, args) {
+            // Small timeout to prevent multiple requests when several fields update at the same time
+            wc_checkout_form.reset_update_checkout_timer();
+            wc_checkout_form.updateTimer = setTimeout(
+                wc_checkout_form.update_checkout_action,
+                "5",
+                args
+            );
+        },
+        update_checkout_action: function (args) {
+            if (wc_checkout_form.xhr) {
+                wc_checkout_form.xhr.abort();
+            }
+
+            if ($("form.checkout").length === 0) {
+                return;
+            }
+
+            args =
+                typeof args !== "undefined"
+                    ? args
+                    : {
+                        update_shipping_method: true,
+                    };
+
+            var country = $("#billing_country").val(),
+                state = $("#billing_state").val(),
+                postcode = $(":input#billing_postcode").val(),
+                city = $("#billing_city").val(),
+                address = $(":input#billing_address_1").val(),
+                address_2 = $(":input#billing_address_2").val(),
+                s_country = country,
+                s_state = state,
+                s_postcode = postcode,
+                s_city = city,
+                s_address = address,
+                s_address_2 = address_2,
+                $required_inputs = $(wc_checkout_form.$checkout_form).find(
+                    ".address-field.validate-required:visible"
+                ),
+                has_full_address = true;
+
+            if ($required_inputs.length) {
+                $required_inputs.each(function () {
+                    if ($(this).find(":input").val() === "") {
+                        has_full_address = false;
+                    }
+                });
+            }
+
+            if ($("#ship-to-different-address").find("input").is(":checked")) {
+                s_country = $("#shipping_country").val();
+                s_state = $("#shipping_state").val();
+                s_postcode = $(":input#shipping_postcode").val();
+                s_city = $("#shipping_city").val();
+                s_address = $(":input#shipping_address_1").val();
+                s_address_2 = $(":input#shipping_address_2").val();
+            }
+
+            var data = {
+                security: wc_checkout_params.update_order_review_nonce,
+                payment_method: wc_checkout_form.get_payment_method(),
+                country: country,
+                state: state,
+                postcode: postcode,
+                city: city,
+                address: address,
+                address_2: address_2,
+                s_country: s_country,
+                s_state: s_state,
+                s_postcode: s_postcode,
+                s_city: s_city,
+                s_address: s_address,
+                s_address_2: s_address_2,
+                has_full_address: has_full_address,
+                post_data: $("form.checkout").serialize(),
+            };
+
+            if (false !== args.update_shipping_method) {
+                var shipping_methods = {};
+
+                // eslint-disable-next-line max-len
+                $(
+                    'select.shipping_method, input[name^="shipping_method"][type="radio"]:checked, input[name^="shipping_method"][type="hidden"]'
+                ).each(function () {
+                    shipping_methods[$(this).data("index")] = $(this).val();
+                });
+
+                data.shipping_method = shipping_methods;
+            }
+
+            $(
+                ".woocommerce-checkout-payment, .woocommerce-checkout-review-order-table"
+            ).block({
+                message: null,
+                overlayCSS: {
+                    background: "#fff",
+                    opacity: 0.6,
+                },
+            });
+
+            wc_checkout_form.xhr = $.ajax({
+                type: "POST",
+                url: wc_checkout_params.wc_ajax_url
+                    .toString()
+                    .replace("%%endpoint%%", "update_order_review"),
+                data: data,
+                success: function (data) {
+                    // Reload the page if requested
+                    if (data && true === data.reload) {
+                        window.location.reload();
+                        return;
+                    }
+
+                    // Remove any notices added previously
+                    $(".woocommerce-NoticeGroup-updateOrderReview").remove();
+
+                    var termsCheckBoxChecked = $("#terms").prop("checked");
+
+                    // Save payment details to a temporary object
+                    var paymentDetails = {};
+                    $(".payment_box :input").each(function () {
+                        var ID = $(this).attr("id");
+
+                        if (ID) {
+                            if (
+                                $.inArray($(this).attr("type"), [
+                                    "checkbox",
+                                    "radio",
+                                ]) !== -1
+                            ) {
+                                paymentDetails[ID] = $(this).prop("checked");
+                            } else {
+                                paymentDetails[ID] = $(this).val();
+                            }
+                        }
+                    });
+
+                    if (
+                        payplus_script_checkout.isHostedFields &&
+                        hasSavedCCs.length === 0 &&
+                        payplus_script_checkout.hidePPGateway
+                    ) {
+                        const checkoutPaymentFragment =
+                            data.fragments[".woocommerce-checkout-payment"];
+                        const modifiedString = modifyCheckoutPaymentFragment(
+                            checkoutPaymentFragment,
+                            "wc_payment_method.payment_method_payplus-payment-gateway"
+                        );
+
+                        data.fragments[".woocommerce-checkout-payment"] =
+                            modifiedString;
+                    }
+
+                    // Always update the fragments
+                    let hostedFields = $(".hostedFields").prop("outerHTML");
+                    if (data && data.fragments) {
+                        $.each(data.fragments, function (key, value) {
+                            if (
+                                !wc_checkout_form.fragments ||
+                                wc_checkout_form.fragments[key] !== value
+                            ) {
+                                $(key).replaceWith(value);
+                                payplus_script_checkout.isSubscriptionOrder
+                                    ? subscriptionOrderHide()
+                                    : null;
+                                if (
+                                    !document.querySelector(
+                                        "#payplus-checkout-image-div"
+                                    )
+                                ) {
+                                    addCustomIcons();
+                                }
+                                let loopImages = true;
+                                multiPassIcons(loopImages);
+                            }
+                            $(key).unblock();
+                            if (typeof newPpShippingMethods !== "undefined") {
+                                createNewShippingMethods();
+                            }
+                        });
+                        if (payplus_script_checkout.isHostedFields) {
+                            putHostedFields(inputPayPlus, hostedIsMain);
+                        }
+                        wc_checkout_form.fragments = data.fragments;
+                        if (
+                            $hostedDiv.parent().attr("class") === "pp_iframe_h"
+                        ) {
+                            hostedFieldsSetup();
+                        }
+                    }
+                    var coupons = [];
+                    var couponCode;
+                    var totalDiscount = 0;
+                    let isSubmitting = false;
+
+                    // var selectedShippingMethod = $(
+                    //     'input[name="shipping_method[0]"]:checked'
+                    // ).val();
+
+                    if (isSubmitting) return; // Prevent multiple submissions
+                    isSubmitting = true; // Set flag to true to block further submissions
+
+                    // console.log(
+                    //     "Selected shipping method ID: " + selectedShippingMethod
+                    // );
+
+                    // Find the label associated with the selected shipping method
+                    var label = $('input[name="shipping_method[0]"]:checked')
+                        .closest("li")
+                        .find("label")
+                        .text();
+
+                    if (label === "") {
+                        label = $('input[name="shipping_method[0]"]')
+                            .closest("li")
+                            .find("label")
+                            .text();
+                    }
+                    // Adjust the regex to support both $ and ₪ (or any currency symbol at start or end)
+                    var priceMatch = label.match(
+                        /(\$|₪)\s*([0-9.,]+)|([0-9.,]+)\s*(\$|₪)/
+                    );
+
+                    let shippingPrice = 0;
+                    if (priceMatch) {
+                        var currency = priceMatch[1] || priceMatch[4]; // Captures the currency symbol
+                        shippingPrice = priceMatch[2] || priceMatch[3]; // Captures the price number
+                    }
+
+                    if (payplus_script_checkout.isHostedFields) {
+                        $(document.body).on("updated_checkout", function () {
+                            putHostedFields(inputPayPlus, hostedIsMain);
+                        });
+                    }
+
+                    // Recheck the terms and conditions box, if needed
+                    if (termsCheckBoxChecked) {
+                        $("#terms").prop("checked", true);
+                    }
+
+                    function putHostedFields(inputPayPlus, hostedIsMain) {
+                        const hideHostedFieldsListItem = () => {
+                            $(".woocommerce-SavedPaymentMethods-new").hide();
+                            $(
+                                ".woocommerce-SavedPaymentMethods-saveNew"
+                            ).hide();
+                        };
+                        hostedIsMain ? hideHostedFieldsListItem() : null;
+
+                        setTimeout(function () {
+                            if (
+                                $(
+                                    "input#payment_method_payplus-payment-gateway-hostedfields"
+                                ).is(":checked")
+                            ) {
+                                $(".container.hostedFields").show();
+                                const ppIframeH =
+                                    document.querySelector(".pp_iframe_h");
+                                if (ppIframeH) {
+                                    ppIframeH.style.display = "block";
+                                }
+                            }
+                        }, 2000);
+
+                        var $paymentMethod = jQuery("#" + inputPayPlus);
+
+                        // Find the closest parent <li>
+                        var $topLi = jQuery(".pp_iframe_h");
+
+                        // Select the existing div element that you want to move
+
+                        var $hostedLi = jQuery(
+                            ".wc_payment_method." + inputPayPlus
+                        );
+                        let $hostedRow = $hostedDiv.find(".hf-main").first();
+                        if (
+                            $paymentMethod.length &&
+                            $topLi.length &&
+                            $hostedDiv.length
+                        ) {
+                            if (payplus_script_checkout.hostedFieldsWidth) {
+                                $hostedRow.attr("style", function (i, style) {
+                                    // Return the width with !important without adding an extra semicolon
+                                    return (
+                                        "width: " +
+                                        payplus_script_checkout.hostedFieldsWidth +
+                                        "% !important;" +
+                                        (style ? " " + style : "")
+                                    );
+                                });
+                            }
+                            $topLi.append($hostedDiv);
+                            $hostedLi.append($topLi);
+                        }
+                    }
+
+                    // Fill in the payment details if possible without overwriting data if set.
+                    if (!$.isEmptyObject(paymentDetails)) {
+                        $(".payment_box :input").each(function () {
+                            var ID = $(this).attr("id");
+                            if (ID) {
+                                if (
+                                    $.inArray($(this).attr("type"), [
+                                        "checkbox",
+                                        "radio",
+                                    ]) !== -1
+                                ) {
+                                    $(this)
+                                        .prop("checked", paymentDetails[ID])
+                                        .trigger("change");
+                                } else if (
+                                    $.inArray($(this).attr("type"), [
+                                        "select",
+                                    ]) !== -1
+                                ) {
+                                    $(this)
+                                        .val(paymentDetails[ID])
+                                        .trigger("change");
+                                } else if (
+                                    null !== $(this).val() &&
+                                    0 === $(this).val().length
+                                ) {
+                                    $(this)
+                                        .val(paymentDetails[ID])
+                                        .trigger("change");
+                                }
+                            }
+                        });
+                    }
+
+                    // Check for error
+                    if (data && "failure" === data.result) {
+                        var $form = $("form.checkout");
+
+                        // Remove notices from all sources
+                        $(".woocommerce-error, .woocommerce-message").remove();
+
+                        // Add new errors returned by this event
+                        if (data.messages) {
+                            $form.prepend(
+                                '<div class="woocommerce-NoticeGroup woocommerce-NoticeGroup-updateOrderReview">' +
+                                data.messages +
+                                "</div>"
+                            ); // eslint-disable-line max-len
+                        } else {
+                            $form.prepend(data);
+                        }
+
+                        // Lose focus for all fields
+                        $form
+                            .find(".input-text, select, input:checkbox")
+                            .trigger("validate")
+                            .trigger("blur");
+
+                        wc_checkout_form.scroll_to_notices();
+                    }
+
+                    // Re-init methods
+                    wc_checkout_form.init_payment_methods();
+
+                    // Fire updated_checkout event.
+                    $(document.body).trigger("updated_checkout", [data]);
+                },
+            });
+        },
+        handleUnloadEvent: function (e) {
+            // Modern browsers have their own standard generic messages that they will display.
+            // Confirm, alert, prompt or custom message are not allowed during the unload event
+            // Browsers will display their own standard messages
+
+            // Check if the browser is Internet Explorer
+            if (
+                navigator.userAgent.indexOf("MSIE") !== -1 ||
+                !!document.documentMode
+            ) {
+                // IE handles unload events differently than modern browsers
+                e.preventDefault();
+                return undefined;
+            }
+
+            return true;
+        },
+        attachUnloadEventsOnSubmit: function () {
+            $(window).on("beforeunload", this.handleUnloadEvent);
+        },
+        detachUnloadEventsOnSubmit: function () {
+            $(window).off("beforeunload", this.handleUnloadEvent);
+        },
+        blockOnSubmit: function ($form) {
+            var isBlocked = $form.data("blockUI.isBlocked");
+
+            if (1 !== isBlocked) {
+                $form.block({
+                    message: null,
+                    overlayCSS: {
+                        top: 0,
+                        height: "100%",
+                        background: "#fff",
+                        opacity: 0.6,
+                    },
+                });
+                $(".blockUI.blockOverlay").css("position", "fixed");
+            }
+        },
+        submitOrder: function () {
+            wc_checkout_form.blockOnSubmit($(this));
+        },
+        submit: function () {
+            wc_checkout_form.reset_update_checkout_timer();
+            var $form = $(this);
+
+            if ($form.is(".processing")) {
+                return false;
+            }
+
+            // Trigger a handler to let gateways manipulate the checkout if needed
+            // eslint-disable-next-line max-len
+            if (
+                $form.triggerHandler("checkout_place_order") !== false &&
+                $form.triggerHandler(
+                    "checkout_place_order_" +
+                    wc_checkout_form.get_payment_method()
+                ) !== false
+            ) {
+                $form.addClass("processing");
+
+                wc_checkout_form.blockOnSubmit($form);
+
+                // Attach event to block reloading the page when the form has been submitted
+                wc_checkout_form.attachUnloadEventsOnSubmit();
+
+                // ajaxSetup is global, but we use it to ensure JSON is valid once returned.
+                $.ajaxSetup({
+                    dataFilter: function (raw_response, dataType) {
+                        // We only want to work with JSON
+                        if ("json" !== dataType) {
+                            return raw_response;
+                        }
+
+                        if (wc_checkout_form.is_valid_json(raw_response)) {
+                            return raw_response;
+                        } else {
+                            // Attempt to fix the malformed JSON
+                            var maybe_valid_json =
+                                raw_response.match(/{"result.*}/);
+
+                            if (null === maybe_valid_json) {
+                                // console.log("Unable to fix malformed JSON");
+                            } else if (
+                                wc_checkout_form.is_valid_json(
+                                    maybe_valid_json[0]
+                                )
+                            ) {
+                                // console.log("Fixed malformed JSON. Original:");
+                                // console.log(raw_response);
+                                raw_response = maybe_valid_json[0];
+                            } else {
+                                // console.log("Unable to fix malformed JSON");
+                            }
+                        }
+                        return raw_response;
+                    },
+                });
+
+                $.ajax({
+                    type: "POST",
+                    url: wc_checkout_params.checkout_url,
+                    data: $form.serialize(),
+                    dataType: "json",
+                    success: function (result) {
+                        if (result.method === "hostedFields") {
+                            jQuery.ajax({
+                                type: "post",
+                                dataType: "json",
+                                url: payplus_script_checkout.ajax_url,
+                                data: {
+                                    action: "get-hosted-payload",
+                                    _ajax_nonce:
+                                        payplus_script_checkout.frontNonce,
+                                },
+                                success: function (response) {
+                                    const hostedPayload = JSON.parse(
+                                        response.data.hostedPayload
+                                    );
+                                    const hostedResponse = JSON.parse(
+                                        response.data.hostedResponse
+                                    );
+                                    if (
+                                        hostedPayload.more_info &&
+                                        !isNaN(hostedPayload.more_info) &&
+                                        typeof hostedPayload.more_info === 'number'
+                                    ) {
+                                        // Proceed with payment submission
+                                        overlay();
+                                        jQuery(
+                                            ".blocks-payplus_loader_hosted"
+                                        ).fadeIn();
+                                        wc_checkout_form.$checkout_form
+                                            .removeClass("processing")
+                                            .unblock();
+                                        hf.SubmitPayment();
+                                    } else {
+                                        window.onbeforeunload = null; // If `onbeforeunload` is set directly
+                                        window.removeEventListener(
+                                            "beforeunload",
+                                            wc_checkout_form.detachUnloadEventsOnSubmit()
+                                        );
+                                        alert(
+                                            "The payment page has expired, refresh the page to continue"
+                                        );
+                                        // Then reload the page
+                                        location.reload();
+                                    }
+                                },
+                            });
+                        } else {
+                            // Detach the unload handler that prevents a reload / redirect
+                            wc_checkout_form.detachUnloadEventsOnSubmit();
+                            if (
+                                result.payplus_iframe &&
+                                "success" === result.result
+                            ) {
+                                wc_checkout_form.$checkout_form
+                                    .removeClass("processing")
+                                    .unblock();
+                                if (result.viewMode == "samePageIframe") {
+                                    openPayplusIframe(
+                                        result.payplus_iframe.data
+                                            .payment_page_link
+                                    );
+                                } else if (result.viewMode == "popupIframe") {
+                                    openIframePopup(
+                                        result.payplus_iframe.data
+                                            .payment_page_link,
+                                        700
+                                    );
+                                }
+                                // Start polling fallback (Layer 2).
+                                startOrderStatusPoll(result);
+                                return true;
+                            }
+                            // Plain 'iframe' mode: the payment page is already on the page.
+                            // The top window navigates away (result.redirect → order-pay page),
+                            // but we can still start polling in case the user stays on this page.
+                            if (
+                                result.viewMode === "iframe" &&
+                                "success" === result.result &&
+                                result.order_id &&
+                                result.order_received_url
+                            ) {
+                                startOrderStatusPoll(result);
+                            }
+                            try {
+                                if (
+                                    "success" === result.result &&
+                                    $form.triggerHandler(
+                                        "checkout_place_order_success",
+                                        result
+                                    ) !== false
+                                ) {
+                                    if (
+                                        -1 ===
+                                        result.redirect.indexOf(
+                                            "https://"
+                                        ) ||
+                                        -1 ===
+                                        result.redirect.indexOf("http://")
+                                    ) {
+                                        payplusRedirect(result.redirect);
+                                    } else {
+                                        payplusRedirect(decodeURI(result.redirect));
+                                    }
+                                } else if ("failure" === result.result) {
+                                    throw "Result failure";
+                                } else {
+                                    throw "Invalid response";
+                                }
+                            } catch (err) {
+                                // Reload page
+                                if (true === result.reload) {
+                                    window.location.reload();
+                                    return;
+                                }
+
+                                // Trigger update in case we need a fresh nonce
+                                if (true === result.refresh) {
+                                    $(document.body).trigger("update_checkout");
+                                }
+
+                                // Add new errors
+                                if (result.messages) {
+                                    wc_checkout_form.submit_error(
+                                        result.messages
+                                    );
+                                } else {
+                                    wc_checkout_form.submit_error(
+                                        '<div class="woocommerce-error">' +
+                                        wc_checkout_params.i18n_checkout_error +
+                                        "</div>"
+                                    ); // eslint-disable-line max-len
+                                }
+                            }
+                        }
+                    },
+                    error: function (jqXHR, textStatus, errorThrown) {
+                        // Detach the unload handler that prevents a reload / redirect
+                        wc_checkout_form.detachUnloadEventsOnSubmit();
+
+                        wc_checkout_form.submit_error(
+                            '<div class="woocommerce-error">' +
+                            errorThrown +
+                            "</div>"
+                        );
+                    },
+                });
+            }
+
+            return false;
+        },
+        submit_error: function (error_message) {
+            $(
+                ".woocommerce-NoticeGroup-checkout, .woocommerce-error, .woocommerce-message"
+            ).remove();
+            wc_checkout_form.$checkout_form.prepend(
+                '<div class="woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout">' +
+                error_message +
+                "</div>"
+            ); // eslint-disable-line max-len
+            wc_checkout_form.$checkout_form.removeClass("processing").unblock();
+            wc_checkout_form.$checkout_form
+                .find(".input-text, select, input:checkbox")
+                .trigger("validate")
+                .trigger("blur");
+            wc_checkout_form.scroll_to_notices();
+            $(document.body).trigger("checkout_error", [error_message]);
+        },
+        scroll_to_notices: function () {
+            var scrollElement = $(
+                ".woocommerce-NoticeGroup-updateOrderReview, .woocommerce-NoticeGroup-checkout"
+            );
+
+            if (!scrollElement.length) {
+                scrollElement = $(".form.checkout");
+            }
+            $.scroll_to_notices(scrollElement);
+        },
+    };
+
+    var wc_checkout_coupons = {
+        init: function () {
+            $(document.body).on("click", "a.showcoupon", this.show_coupon_form);
+            $(document.body).on(
+                "click",
+                ".woocommerce-remove-coupon",
+                this.remove_coupon
+            );
+            $("form.checkout_coupon").hide().on("submit", this.submit);
+        },
+        show_coupon_form: function () {
+            $(".checkout_coupon").slideToggle(400, function () {
+                $(".checkout_coupon").find(":input:eq(0)").trigger("focus");
+            });
+            return false;
+        },
+        submit: function () {
+            var $form = $(this);
+
+            if ($form.is(".processing")) {
+                return false;
+            }
+
+            $form.addClass("processing").block({
+                message: null,
+                overlayCSS: {
+                    background: "#fff",
+                    opacity: 0.6,
+                },
+            });
+
+            var data = {
+                security: wc_checkout_params.apply_coupon_nonce,
+                coupon_code: $form.find('input[name="coupon_code"]').val(),
+            };
+
+            $.ajax({
+                type: "POST",
+                url: wc_checkout_params.wc_ajax_url
+                    .toString()
+                    .replace("%%endpoint%%", "apply_coupon"),
+                data: data,
+                success: function (code) {
+                    $(".woocommerce-error, .woocommerce-message").remove();
+                    $form.removeClass("processing").unblock();
+
+                    if (code) {
+                        $form.before(code);
+                        $form.slideUp();
+
+                        $(document.body).trigger("applied_coupon_in_checkout", [
+                            data.coupon_code,
+                        ]);
+                        $(document.body).trigger("update_checkout", {
+                            update_shipping_method: false,
+                        });
+                    }
+                },
+                dataType: "html",
+            });
+
+            return false;
+        },
+        remove_coupon: function (e) {
+            e.preventDefault();
+
+            var container = $(this).parents(
+                ".woocommerce-checkout-review-order"
+            ),
+                coupon = $(this).data("coupon");
+
+            container.addClass("processing").block({
+                message: null,
+                overlayCSS: {
+                    background: "#fff",
+                    opacity: 0.6,
+                },
+            });
+
+            var data = {
+                security: wc_checkout_params.remove_coupon_nonce,
+                coupon: coupon,
+            };
+
+            $.ajax({
+                type: "POST",
+                url: wc_checkout_params.wc_ajax_url
+                    .toString()
+                    .replace("%%endpoint%%", "remove_coupon"),
+                data: data,
+                success: function (code) {
+                    $(".woocommerce-error, .woocommerce-message").remove();
+                    container.removeClass("processing").unblock();
+
+                    if (code) {
+                        $("form.woocommerce-checkout").before(code);
+                        $(document.body).trigger("removed_coupon_in_checkout", [
+                            data.coupon_code,
+                        ]);
+                        $(document.body).trigger("update_checkout", {
+                            update_shipping_method: false,
+                        });
+                        $("form.checkout_coupon")
+                            .find('input[name="coupon_code"]')
+                            .val("");
+                    }
+                },
+                error: function () {
+                },
+                dataType: "html",
+            });
+        },
+    };
+
+    var wc_checkout_login_form = {
+        init: function () {
+            $(document.body).on("click", "a.showlogin", this.show_login_form);
+        },
+        show_login_form: function () {
+            $("form.login, form.woocommerce-form--login").slideToggle();
+            return false;
+        },
+    };
+
+    var wc_terms_toggle = {
+        init: function () {
+            $(document.body).on(
+                "click",
+                "a.woocommerce-terms-and-conditions-link",
+                this.toggle_terms
+            );
+        },
+
+        toggle_terms: function () {
+            if ($(".woocommerce-terms-and-conditions").length) {
+                $(".woocommerce-terms-and-conditions").slideToggle(function () {
+                    var link_toggle = $(
+                        ".woocommerce-terms-and-conditions-link"
+                    );
+
+                    if ($(".woocommerce-terms-and-conditions").is(":visible")) {
+                        link_toggle.addClass(
+                            "woocommerce-terms-and-conditions-link--open"
+                        );
+                        link_toggle.removeClass(
+                            "woocommerce-terms-and-conditions-link--closed"
+                        );
+                    } else {
+                        link_toggle.removeClass(
+                            "woocommerce-terms-and-conditions-link--open"
+                        );
+                        link_toggle.addClass(
+                            "woocommerce-terms-and-conditions-link--closed"
+                        );
+                    }
+                });
+
+                return false;
+            }
+        },
+    };
+
+    wc_checkout_form.init();
+    wc_checkout_coupons.init();
+    wc_checkout_login_form.init();
+    wc_terms_toggle.init();
+
+    // After every checkout update, ensure selectedPaymentMethod is synced with the
+    // actually-checked payment method radio. This handles cases where:
+    // - Token-switching logic programmatically checked the main gateway
+    // - Fragment refresh rendered a different method as checked than what the user selected
+    // - User interacted with hosted fields iframe (clicks don't bubble to our handlers)
+    $(document.body).on('updated_checkout', function() {
+        var $checked = $('input[name="payment_method"]:checked');
+        if ($checked.length) {
+            var checkedId = $checked.attr('id');
+            if (checkedId && wc_checkout_form.selectedPaymentMethod !== checkedId) {
+                wc_checkout_form.selectedPaymentMethod = checkedId;
+            }
+        }
+    });
+
+    // Sync order total inside hosted fields card (classic checkout only)
+    function updateHostedFieldsTotal() {
+        var $totalEl = $('.order-total .woocommerce-Price-amount');
+        var $ppTotal = $('#ppOrderTotal');
+        if ($totalEl.length && $ppTotal.length) {
+            var totalHtml = $totalEl.first().html();
+            $ppTotal.find('.pp-total-amount').html(totalHtml);
+            $ppTotal.show();
+        }
+    }
+
+    if (payplus_script_checkout.isHostedFields && payplus_script_checkout.showOrderTotal) {
+        $(document.body).on('updated_checkout', function() {
+            updateHostedFieldsTotal();
+        });
+        // Initial load
+        setTimeout(updateHostedFieldsTotal, 500);
+    }
+
+    // Hide main gateway visually when hosted fields is main (but keep it in DOM for token payments)
+    if (payplus_script_checkout.hostedFieldsIsMain) {
+        var hideMainGateway = function() {
+            // Target the li element specifically
+            $('li.payment_method_payplus-payment-gateway').attr('style', 'display: none !important;');
+        };
+
+        // When hosted fields is the selected method, ensure its payment box is visible (on load and after fragment refresh).
+        function ensureHostedFieldsBoxVisible() {
+            var $hostedFieldsInput = $('input#payment_method_payplus-payment-gateway-hostedfields');
+            if (!$hostedFieldsInput.length) {
+                return;
+            }
+            if (!$hostedFieldsInput.is(':checked')) {
+                $hostedFieldsInput.prop('checked', true).trigger('change');
+            }
+            $('.payment_box.payment_method_payplus-payment-gateway-hostedfields').show().css('display', 'block');
+        }
+
+        // Hide immediately
+        hideMainGateway();
+
+        // On every checkout update: hide main gateway and, if hosted fields is selected, keep its box open
+        $(document.body).on('updated_checkout', function() {
+            hideMainGateway();
+            ensureHostedFieldsBoxVisible();
+        });
+
+        // On initial load: ensure hosted fields is selected and its payment box is visible (including when saved tokens exist)
+        setTimeout(function() {
+            hideMainGateway();
+            ensureHostedFieldsBoxVisible();
+        }, 100);
+    }
+
+    $(document.body).on('change', 'input[name="payment_method"]', function() {
+        var selectedMethod = $('input[name="payment_method"]:checked').val();
+        // When hosted fields is selected, ensure its payment box is visible
+        if (selectedMethod === 'payplus-payment-gateway-hostedfields') {
+            $('.payment_box.payment_method_payplus-payment-gateway-hostedfields').show();
+        }
+    });
+
+    $(document.body).on('click', '#place_order', function(e) {
+        var selectedToken = $('input[name="wc-payplus-payment-gateway-payment-token"]:checked').val();
+        var $hostedFieldsInput = $('input#payment_method_payplus-payment-gateway-hostedfields');
+        var $mainGatewayInput = $('input#payment_method_payplus-payment-gateway');
+
+        // If a saved token is selected (not "new") and hosted fields is checked, switch to main gateway
+        if ($hostedFieldsInput.is(':checked') && selectedToken && selectedToken !== 'new') {
+            if ($mainGatewayInput.length === 0) {
+                alert('Error: Payment method not available for saved cards. Please contact support.');
+                e.preventDefault();
+                return false;
+            }
+            $mainGatewayInput.prop('checked', true);
+            $hostedFieldsInput.prop('checked', false);
+        }
+    });
+
+    // Handle saved payment method selection for hosted fields
+    // When a saved token is selected, temporarily show main gateway method for processing
+    $(document.body).on('change', 'input[name="wc-payplus-payment-gateway-payment-token"]', function() {
+        var selectedValue = $(this).val();
+        var $hostedFieldsInput = $('input#payment_method_payplus-payment-gateway-hostedfields');
+        var $mainGatewayLi = $('.payment_method_payplus-payment-gateway');
+        var $mainGatewayInput = $('input#payment_method_payplus-payment-gateway');
+
+        if ($hostedFieldsInput.is(':checked')) {
+            if (selectedValue !== 'new') {
+                // A saved token is selected — route through the main gateway for processing.
+                // We only need the radio to be checked for form serialisation; we must NOT
+                // apply display:none to the main gateway <li> here because this handler also
+                // fires during WC's paymentDetails restore after every checkout fragment
+                // refresh, which would incorrectly hide the gateway on every shipping change.
+                // The hostedIsMain case is handled separately by hideMainGateway().
+                if ($mainGatewayLi.length === 0) {
+                    // Main gateway was removed from the fragment (hidePPGateway with no tokens);
+                    // inject a hidden placeholder so WC can serialise the correct payment_method.
+                    var mainGatewayHtml = '<li class="wc_payment_method payment_method_payplus-payment-gateway" style="display:none !important;">' +
+                        '<input id="payment_method_payplus-payment-gateway" type="radio" class="input-radio" name="payment_method" value="payplus-payment-gateway" />' +
+                        '<label for="payment_method_payplus-payment-gateway">PayPlus</label>' +
+                        '<div class="payment_box payment_method_payplus-payment-gateway"></div>' +
+                        '</li>';
+                    $('.payment_method_payplus-payment-gateway-hostedfields').before(mainGatewayHtml);
+                    $mainGatewayInput = $('input#payment_method_payplus-payment-gateway');
+                }
+                $mainGatewayInput.prop('checked', true);
+                $('body').attr('data-payplus-using-token', 'yes');
+            } else {
+                $hostedFieldsInput.prop('checked', true);
+                $('body').attr('data-payplus-using-token', 'no');
+            }
+        }
+    });
+
+    // When hosted fields payment method is selected (via radio click/change), deselect saved tokens.
+    // Uses a separate handler because WC's payment_method_selected calls stopPropagation(),
+    // preventing the click from reaching document.body.
+    $(document.body).on('payment_method_selected', function() {
+        var $hostedFieldsInput = $('input#payment_method_payplus-payment-gateway-hostedfields');
+        if ($hostedFieldsInput.is(':checked')) {
+            var $tokenChecked = $('input[name="wc-payplus-payment-gateway-payment-token"]:checked');
+            if ($tokenChecked.length && $tokenChecked.val() !== 'new') {
+                $tokenChecked.prop('checked', false);
+                $('input#wc-payplus-payment-gateway-payment-token-new').prop('checked', true).trigger('change');
+            }
+        }
+    });
+
+    // Make pp_iframe_h clickable to select payment method
+    $(document.body).on('click touchstart', '.pp_iframe_h', function(e) {
+        // Find the parent li element that contains the payment method input
+        var $parentLi = $(this).closest('li.wc_payment_method');
+        
+        if ($parentLi.length) {
+            // Find the payment method radio input within the parent li
+            var $paymentInput = $parentLi.find('input[name="payment_method"]');
+            
+            if ($paymentInput.length && !$paymentInput.is(':checked')) {
+                // Trigger click on the radio input to select this payment method
+                $paymentInput.prop('checked', true).trigger('click');
+            }
+        }
+    });
+
+    $(
+        $(window).on("popstate", () => {
+            closePayplusIframe(false);
+        })
+    );
+
+    function closePayplusIframe(force) {
+        if (
+            $("#pp_iframe").length &&
+            ($("#pp_iframe").is(":visible") || force === true)
+        ) {
+            stopOrderStatusPoll();
+            $("#pp_iframe").fadeOut(() => {
+                $(".payplus-option-description-area").show();
+                $("#place_order").prop("disabled", false);
+            });
+        }
+    }
+
+    let isAppleLoaded = false;
+    function addScriptApple() {
+        if (!isAppleLoaded) {
+            const script = document.createElement("script");
+            script.src = payplus_script_checkout.payplus_import_applepay_script;
+            document.body.append(script);
+            isAppleLoaded = true;
+        } else {
+            console.log("Apple script already loaded");
+        }
+    }
+
+    function getIframePayment(src, width, height) {
+        let iframe = document.createElement("iframe");
+        iframe.id = "pp_iframe";
+        iframe.name = "payplus-iframe";
+        iframe.src = src;
+        if(iframeAutoHeight) {
+            iframe.height = "100%";
+            iframe.maxHeight = "100vh";
+        } else {
+            iframe.height = height;
+        }
+        iframe.width = width;
+        iframe.setAttribute("style", `border:0px`);
+        iframe.setAttribute("allowpaymentrequest", "allowpaymentrequest");
+        // allow-top-navigation lets PayPlus's own redirectAfterTransaction navigate the top
+        // window to the callback URL after payment — required for the redirect to work at all.
+        // Using the unconditional flag (not -by-user-activation) avoids:
+        //   • Chrome "Unsafe attempt to initiate navigation" errors (gesture expiry)
+        //   • Firefox "prevented redirect" permission bar
+        // The callback URL (IPN URL) is immediately redirected to the clean thank-you URL
+        // by payplus_redirect_graceful, so users never see it in the address bar.
+        iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation");
+        return iframe;
+    }
+    function openPayplusIframe(src) {
+        $(".alertify").remove();
+        const url = new URL(window.location.href);
+        url.searchParams.set("payplus-iframe", "1");
+        window.history.pushState({}, "", url);
+        const ppIframe = document.querySelector(".pp_iframe");
+        const height = ppIframe.getAttribute("data-height");
+        ppIframe.innerHTML = "";
+        ppIframe.append(getIframePayment(src, "100%", height));
+        $("#closeFrame").on("click", function (e) {
+            e.preventDefault();
+            stopOrderStatusPoll();
+            ppIframe.style.display = "none";
+        });
+        $("#place_order").prop("disabled", true);
+
+        if (payplus_script_checkout.payplus_mobile) {
+            $("html, body").animate({
+                scrollTop: $(".place-order").offset().top,
+            });
+        }
+        addScriptApple();
+    }
+
+    function openIframePopup(src, height) {
+        let windowWidth = window.innerWidth;
+        if (windowWidth < 568) {
+            height = "100%";
+        }
+
+        if (!alertify.popupIframePaymentPage) {
+            alertify.dialog("popupIframePaymentPage", function factory() {
+                return {
+                    main: function (src) {
+                        this.message = getIframePayment(src, "100%", height);
+                        addScriptApple();
+                    },
+                    setup: function () {
+                        return {
+                            options: {
+                                autoReset: false,
+                                overflow: false,
+                                maximizable: false,
+                                movable: false,
+                                frameless: true,
+                                transition: "fade",
+                            },
+                            focus: {
+                                element: 0,
+                            },
+                        };
+                    },
+
+                    prepare: function () {
+                        this.setContent(this.message);
+                    },
+
+                    hooks: {
+                        onshow: function () {
+                            this.elements.dialog.style.maxWidth = "100%";
+                            this.elements.dialog.style.width = windowWidth > 768 ? (payplus_script_checkout.iframeWidth || "40%") : "98%";
+                            this.elements.dialog.style.height =
+                                windowWidth > 568 ? "82%" : "100%";
+                            this.elements.content.style.top = "25px";
+                        },
+                        onclose: function () {
+                            stopOrderStatusPoll();
+                        },
+                    },
+                };
+            });
+        }
+        alertify.popupIframePaymentPage(src);
+    }
+
+    // Add custom icons field if exists under cc method description
+    function addCustomIcons() {
+        if (
+            typeof payplus_script_checkout?.customIcons[0] !== "undefined" &&
+            payplus_script_checkout?.customIcons[0]?.length > 0
+        ) {
+            var $hostedDiv = $("<div></div>", {
+                class: "payplus-checkout-image-container", // Optional: Add a class to the div
+                id: "payplus-checkout-image-div", // Optional: Add an ID to the div
+                style: "display: flex;flex-wrap: wrap;justify-content: center;", // Optional: Add inline styles
+            });
+            $.each(
+                payplus_script_checkout.customIcons,
+                function (index, value) {
+                    var $img = $("<img>", {
+                        src: value,
+                        class: "payplus-checkout-image", // Optional: Add a class to the image
+                        alt: "Image " + (index + 1), // Optional: Set alt text for accessibility
+                        style: "max-width: 100%; max-height:35px;object-fit: contain;", // Optional: Set inline styles
+                    });
+                    $hostedDiv.append($img);
+                }
+            );
+            $("div.payment_method_payplus-payment-gateway").prepend($hostedDiv);
+        }
+    }
+
+    function modifyCheckoutPaymentFragment(fragmentHtml, liClassToRemove) {
+        // Create a temporary div to hold the HTML string
+        const tempDiv = document.createElement("div");
+
+        // Set the inner HTML of the temp div to the fragment HTML
+        tempDiv.innerHTML = fragmentHtml;
+
+        // Select the <li> elements with the specified class
+        const liElements = tempDiv.querySelectorAll(`.${liClassToRemove}`);
+
+        // Loop through the selected <li> elements and remove them
+        liElements.forEach((li) => {
+            li.remove();
+        });
+
+        // Convert the modified contents back to a string
+        const modifiedFragmentString = tempDiv.innerHTML;
+        // Return the modified string if needed
+        return modifiedFragmentString;
+    }
+
+    function multiPassIcons(loopImages) {
+        /* Check if multipass method is available and if so check for clubs and replace icons! */
+
+        const element = document.querySelector(
+            "#payment_method_payplus-payment-gateway-multipass"
+        );
+
+        if (
+            element &&
+            Object.keys(payplus_script_checkout.multiPassIcons).length > 0
+        ) {
+            const multiPassIcons = payplus_script_checkout.multiPassIcons;
+
+            // Function to find an image by its src attribute
+            function findImageBySrc(src) {
+                // Find all images within the document
+                let images = document.querySelectorAll("img");
+                // Loop through images to find the one with the matching src
+                for (let img of images) {
+                    if (img.src.includes(src)) {
+                        return img;
+                    }
+                }
+                return null;
+            }
+
+            // Function to replace the image source with fade effect
+            function replaceImageSourceWithFade(image, newSrc) {
+                if (image && newSrc) {
+                    image.style.height = "32px";
+                    image.style.width = "32px";
+                    image.style.transition = "opacity 0.5s";
+                    image.style.opacity = 0;
+
+                    setTimeout(() => {
+                        image.src = newSrc;
+                        image.style.opacity = 1;
+                    }, 500);
+                }
+            }
+
+            // Example usage
+            if (element) {
+                // Find the image with the specific src
+                let imageToChange = findImageBySrc("multipassLogo.png");
+                if (imageToChange) {
+                    let originalSrc = imageToChange.src;
+                    let imageIndex = 0;
+                    const imageKeys = Object.keys(multiPassIcons);
+                    const sources = imageKeys.map((key) => multiPassIcons[key]);
+
+                    function loopReplaceImageSource() {
+                        const newSrc = sources[imageIndex];
+                        replaceImageSourceWithFade(imageToChange, newSrc);
+                        imageIndex = (imageIndex + 1) % sources.length;
+                        if (
+                            Object.keys(payplus_script_checkout.multiPassIcons)
+                                .length > 1
+                        ) {
+                            setTimeout(loopReplaceImageSource, 2000); // Change image every 3 seconds
+                        }
+                    }
+
+                    loopReplaceImageSource();
+                    loopImages = false;
+                }
+            }
+        }
+        /* finished multipass image replace */
+    }
+});
