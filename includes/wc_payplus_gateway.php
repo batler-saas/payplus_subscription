@@ -4283,16 +4283,64 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         $handle   = 'payplus_installment_renewal';
         $order_id = $order->get_id();
 
-        // Get saved token
-        $token = get_user_meta($order->get_user_id(), 'cc_token', true);
+        // Get subscription ID (needed for both token and installment data)
+        $subscription_id = WC_PayPlus_Meta_Data::get_meta($order_id, '_subscription_renewal', true);
+        $parent_order_id = 0;
+        if ($subscription_id) {
+            $parent_order_id = wp_get_post_parent_id($subscription_id);
+        }
+
+        // Get saved token — try multiple sources
+        $token = '';
+        $token_source = '';
+
+        // 1. Try parent order of the subscription (most reliable)
+        if ($parent_order_id) {
+            $token = WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_token_uid', true);
+            if (!empty($token)) $token_source = "parent_order_$parent_order_id";
+        }
+
+        // 2. Try the subscription itself
+        if (empty($token) && $subscription_id) {
+            $token = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_token_uid', true);
+            if (!empty($token)) $token_source = "subscription_$subscription_id";
+        }
+
+        // 3. Fallback to user meta
+        if (empty($token)) {
+            $token = get_user_meta($order->get_user_id(), 'cc_token', true);
+            if (!empty($token)) $token_source = 'user_meta_cc_token';
+        }
+
+        $this->payplus_add_log_all($handle, "Order $order_id: token=$token source=$token_source");
+
         if (empty($token)) {
             $order->add_order_note(__('PayPlus Installment Renewal Failed: no saved token found.', 'payplus-payment-gateway'));
-            $this->payplus_add_log_all($handle, "Order $order_id: no token.", 'error');
+            $this->payplus_add_log_all($handle, "Order $order_id: no token found in any source.", 'error');
             return ['success' => false, 'msg' => 'No token found'];
         }
 
+        // Validate token via Token/Check API
+        $token_check_url = $this->api_url . 'Token/Check/' . $token;
+        $this->payplus_add_log_all($handle, "Order $order_id: validating token via GET $token_check_url");
+        $check_response = wp_remote_get($token_check_url, [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'Authorization' => '{"api_key":"' . ($this->api_test_mode ? $this->get_option('dev_api_key') : $this->get_option('api_key')) . '","secret_key":"' . ($this->api_test_mode ? $this->get_option('dev_secret_key') : $this->get_option('secret_key')) . '"}',
+            ],
+        ]);
+        if (!is_wp_error($check_response)) {
+            $check_body = json_decode(wp_remote_retrieve_body($check_response));
+            $this->payplus_add_log_all($handle, "Order $order_id: Token/Check response: " . wp_json_encode($check_body));
+            if (isset($check_body->results->status) && $check_body->results->status === 'error') {
+                $check_desc = $check_body->results->description ?? 'Token validation failed';
+                $order->add_order_note(sprintf(__('PayPlus Installment Renewal Failed: token invalid — %s', 'payplus-payment-gateway'), $check_desc));
+                $this->payplus_add_log_all($handle, "Order $order_id: token invalid — $check_desc", 'error');
+                return ['success' => false, 'msg' => $check_desc];
+            }
+        }
+
         // Get installment data from parent subscription
-        $subscription_id = WC_PayPlus_Meta_Data::get_meta($order_id, '_subscription_renewal', true);
         $num_payments    = 0;
         $first_amount    = 0.0;
         $nonfirst_amount = 0.0;
@@ -4303,13 +4351,10 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
             $nonfirst_amount = floatval(WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_rest_payments_amount', true));
 
             // Fallback: check parent order of the subscription
-            if (!$num_payments) {
-                $parent_order_id = wp_get_post_parent_id($subscription_id);
-                if ($parent_order_id) {
-                    $num_payments    = intval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_number_of_payments', true));
-                    $first_amount    = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_first_payment_amount', true));
-                    $nonfirst_amount = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_rest_payments_amount', true));
-                }
+            if (!$num_payments && $parent_order_id) {
+                $num_payments    = intval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_number_of_payments', true));
+                $first_amount    = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_first_payment_amount', true));
+                $nonfirst_amount = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_rest_payments_amount', true));
             }
         }
 
@@ -4345,6 +4390,11 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 'nonfirst_amount' => $nonfirst_amount,
             ],
         ];
+
+        // Save payload as order meta for admin visibility
+        WC_PayPlus_Meta_Data::update_meta($order, [
+            'payplus_installment_payload' => wp_json_encode($payload),
+        ]);
 
         $this->payplus_add_log_all($handle, "Order $order_id: POST {$this->charge_url} " . wp_json_encode($payload));
 

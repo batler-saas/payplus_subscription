@@ -228,7 +228,7 @@ class WC_PayPlus_Admin_Payments extends WC_PayPlus_Gateway
     public function payPlusMetaboxes()
     {
         $screen = get_current_screen();
-        if ($screen->post_type === 'shop_order') {
+        if (in_array($screen->post_type, ['shop_order', 'shop_subscription'])) {
             if (($this->isInvoiceEnable  && $this->useDedicatedMetaBox) || $this->invoiceDisplayOnly) {
                 add_meta_box(
                     'invoice_plus_order_metabox',
