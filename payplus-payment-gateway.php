@@ -1581,16 +1581,8 @@ body{
      */
     public function admin_notices()
     {
-        $integrity_check_result = get_transient('payplus_plugin_integrity_check_failed');
-        if ($integrity_check_result) {
-            delete_transient('payplus_plugin_integrity_check_failed');
-        ?>
-            <div class="notice notice-error is-dismissible">
-                <p>
-                    <strong>PayPlus Plugin Security Warning:</strong> <?php echo esc_html($integrity_check_result); ?>
-                </p>
-            </div><?php
-                }
+        // Integrity check disabled for PayPlus Subscriptions Pro (modified plugin)
+        // $integrity_check_result = get_transient('payplus_plugin_integrity_check_failed');
 
                 $output = '';
                 $title = esc_html__('PayPlus Payment Gateway', 'payplus-payment-gateway');
@@ -2567,5 +2559,5 @@ body{
         register_activation_hook(__FILE__, 'payplus_create_table_process');
         register_activation_hook(__FILE__, 'payplus_check_set_payplus_options');
         register_activation_hook(__FILE__, 'payplusGenerateErrorPage');
-        register_activation_hook(__FILE__, 'payplus_display_hash_check_notice');
+        // register_activation_hook(__FILE__, 'payplus_display_hash_check_notice');
         register_deactivation_hook(__FILE__, 'payplus_cron_deactivate');
