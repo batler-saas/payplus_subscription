@@ -37,6 +37,8 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
     public $device_uid;
     public $payment_page_id;
     public $disable_woocommerce_scheduler;
+    public $subscription_terminal_uid;
+    public $subscription_cashier_uid;
     public $initial_invoice;
     public $paying_vat;
     public $paying_vat_all_order;
@@ -186,6 +188,8 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         $this->hide_icon = $this->get_option('hide_icon');
         $this->transaction_type = $this->get_option('transaction_type');
         $this->disable_woocommerce_scheduler = $this->get_option('disable_woocommerce_scheduler');
+        $this->subscription_terminal_uid = $this->get_option('subscription_terminal_uid', '');
+        $this->subscription_cashier_uid  = $this->get_option('subscription_cashier_uid', '');
         $this->initial_invoice = $this->get_option('initial_invoice');
         $this->paying_vat = $this->get_option('paying_vat');
         $this->paying_vat_all_order = $this->get_option('paying_vat_all_order');
@@ -250,6 +254,7 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         $this->ipn_url = $this->api_url . 'PaymentPages/ipn';
         $this->invoice_search = $this->api_url . 'books/docs/list';
         $this->refund_url = $this->api_url . 'Transactions/RefundByTransactionUID';
+        $this->charge_url = $this->api_url . 'Transactions/Charge';
         $this->clearing_companies_url = $this->api_url . 'ClearingCompanies';
         $this->issuers_companies_url = $this->api_url . 'issuerscompanies';
         $this->brands_list_url = $this->api_url . 'BrandsList';
@@ -4270,6 +4275,140 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         exit;
     }
 
+    /**
+     * Charge a subscription renewal via Transactions/Charge with installments.
+     */
+    public function charge_installment_renewal($amount_to_charge, $order) {
+
+        $handle   = 'payplus_installment_renewal';
+        $order_id = $order->get_id();
+
+        // Get saved token
+        $token = get_user_meta($order->get_user_id(), 'cc_token', true);
+        if (empty($token)) {
+            $order->add_order_note(__('PayPlus Installment Renewal Failed: no saved token found.', 'payplus-payment-gateway'));
+            $this->payplus_add_log_all($handle, "Order $order_id: no token.", 'error');
+            return ['success' => false, 'msg' => 'No token found'];
+        }
+
+        // Get installment data from parent subscription
+        $subscription_id = WC_PayPlus_Meta_Data::get_meta($order_id, '_subscription_renewal', true);
+        $num_payments    = 0;
+        $first_amount    = 0.0;
+        $nonfirst_amount = 0.0;
+
+        if ($subscription_id) {
+            $num_payments    = intval(WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_number_of_payments', true));
+            $first_amount    = floatval(WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_first_payment_amount', true));
+            $nonfirst_amount = floatval(WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_rest_payments_amount', true));
+
+            // Fallback: check parent order of the subscription
+            if (!$num_payments) {
+                $parent_order_id = wp_get_post_parent_id($subscription_id);
+                if ($parent_order_id) {
+                    $num_payments    = intval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_number_of_payments', true));
+                    $first_amount    = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_first_payment_amount', true));
+                    $nonfirst_amount = floatval(WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_rest_payments_amount', true));
+                }
+            }
+        }
+
+        $this->payplus_add_log_all($handle, "Order $order_id: num_payments=$num_payments first=$first_amount nonfirst=$nonfirst_amount");
+
+        // No installments — fall back to single charge via receipt_page
+        if ($num_payments <= 1) {
+            $this->payplus_add_log_all($handle, "Order $order_id: no installments, falling back to single charge.");
+            return $this->receipt_page($order_id, $token, true, 'WP_SUB_' . $order_id, $amount_to_charge, false, false);
+        }
+
+        // Calculate equal split if amounts not stored
+        if ($first_amount <= 0 || $nonfirst_amount <= 0) {
+            $per             = round($amount_to_charge / $num_payments, 2);
+            $first_amount    = $per;
+            $nonfirst_amount = $per;
+        }
+
+        // Build payload
+        $payload = [
+            'terminal_uid'  => $this->subscription_terminal_uid,
+            'cashier_uid'   => $this->subscription_cashier_uid,
+            'amount'        => $amount_to_charge,
+            'currency_code' => $order->get_currency() ?: 'ILS',
+            'credit_terms'  => 8,
+            'use_token'     => true,
+            'token'         => $token,
+            'more_info_1'   => (string) $order_id,
+            'more_info_4'   => PAYPLUS_VERSION,
+            'payments'      => [
+                'number'          => $num_payments,
+                'first_amount'    => $first_amount,
+                'nonfirst_amount' => $nonfirst_amount,
+            ],
+        ];
+
+        $this->payplus_add_log_all($handle, "Order $order_id: POST {$this->charge_url} " . wp_json_encode($payload));
+
+        $response = WC_PayPlus_Statics::payPlusRemote($this->charge_url, $payload);
+
+        if (is_wp_error($response)) {
+            $err = $response->get_error_message();
+            $order->add_order_note(sprintf(__('PayPlus Installment Renewal Failed: %s', 'payplus-payment-gateway'), $err));
+            $this->payplus_add_log_all($handle, "Order $order_id: WP_Error — $err", 'error');
+            return ['success' => false, 'msg' => $err];
+        }
+
+        $res         = json_decode(wp_remote_retrieve_body($response));
+        $status      = $res->data->status          ?? '';
+        $status_code = $res->data->status_code     ?? '';
+        $txn_uid     = $res->data->transaction_uid ?? '';
+        $txn_number  = $res->data->number          ?? '';
+
+        $this->payplus_add_log_all($handle, "Order $order_id: status=$status code=$status_code txn=$txn_uid");
+
+        if ($status === 'approved' && $status_code === '000' && $txn_uid) {
+
+            WC_PayPlus_Meta_Data::update_meta($order, [
+                'payplus_type'                 => $res->data->type ?? 'Charge',
+                'payplus_method'               => 'credit-card',
+                'payplus_response'             => wp_json_encode($res->data),
+                'payplus_transaction_uid'      => $txn_uid,
+                'payplus_status_active'        => 1,
+                'payplus_number_of_payments'   => $num_payments,
+                'payplus_first_payment_amount' => $first_amount,
+                'payplus_rest_payments_amount' => $nonfirst_amount,
+                'payplus_credit-card'          => $amount_to_charge,
+            ]);
+            delete_post_meta($order_id, 'payplus_error_sub');
+
+            $order->add_order_note(sprintf(
+                __('PayPlus Installment Renewal Successful<br/>Transaction: %1$s | Payments: %2$d', 'payplus-payment-gateway'),
+                $txn_number, $num_payments
+            ));
+
+            if ($this->recurring_order_set_to_paid === 'yes') {
+                $order->payment_complete();
+                $order->update_status('completed');
+            } elseif ($this->successful_order_status !== 'default-woo') {
+                $order->update_status($this->successful_order_status);
+            } else {
+                $order->update_status('wc-processing');
+            }
+
+            $this->payplus_add_log_all($handle, "Order $order_id: SUCCESS txn=$txn_uid payments=$num_payments", 'completed');
+            return ['success' => true, 'msg' => ''];
+
+        } else {
+
+            $description = $res->data->status_description ?? $res->results->description ?? 'Unknown error';
+            $order->add_order_note(sprintf(
+                __('PayPlus Installment Renewal Failed<br/>Status: %1$s | Code: %2$s | %3$s', 'payplus-payment-gateway'),
+                $status, $status_code, $description
+            ));
+            $this->payplus_add_log_all($handle, "Order $order_id: FAILED — $description", 'error');
+            return ['success' => false, 'msg' => $description];
+        }
+    }
+
     //subscription
 
     /**
@@ -4289,6 +4428,11 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
             if (empty($payplus_status_active)) {
                 $token = get_user_meta($order->user_id, 'cc_token', true);
                 $this->payplus_add_log_all($handle, 'Subscription Started. Order ID:( ' . $order->get_id() . ' )- Token: ' . $token);
+
+                // If Terminal + Cashier UIDs configured — charge with installments
+                if (!empty($this->subscription_terminal_uid) && !empty($this->subscription_cashier_uid)) {
+                    return $this->charge_installment_renewal($amount_to_charge, $order);
+                }
 
                 $result = $this->receipt_page($order->get_id(), $token, true, 'WP_SUB_' . $order->get_id(), $amount_to_charge, false, $move_token);
 
