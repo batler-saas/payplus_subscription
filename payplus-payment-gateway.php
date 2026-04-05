@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Plugin Name: PayPlus Payment Gateway
+ * Plugin Name: PayPlus Subscriptions Pro
  * Description: Accept credit/debit card payments or other methods such as bit, Apple Pay, Google Pay in one page. Create digitally signed invoices & much more.
  * Plugin URI: https://www.payplus.co.il/wordpress
  * Version: 8.1.6

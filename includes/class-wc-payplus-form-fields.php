@@ -1140,6 +1140,27 @@ Orders that were successful and cancelled manually will not be tested or updated
                 'type' => 'checkbox',
                 'default' => 'no',
             ],
+            // ── Subscription Installments ──────────────────────────
+            'subscription_installments_title' => [
+                'title'       => __('Subscription Renewal — Installments', 'payplus-payment-gateway'),
+                'type'        => 'title',
+                'description' => __('Charge subscription renewals via Transactions/Charge API with the same installments as the original order.', 'payplus-payment-gateway'),
+            ],
+            'subscription_terminal_uid' => [
+                'title'       => __('Terminal UID', 'payplus-payment-gateway'),
+                'type'        => 'text',
+                'default'     => '',
+                'description' => __('Required for Transactions/Charge API. Find in your PayPlus account.', 'payplus-payment-gateway'),
+                'desc_tip'    => true,
+            ],
+            'subscription_cashier_uid' => [
+                'title'       => __('Cashier UID', 'payplus-payment-gateway'),
+                'type'        => 'text',
+                'default'     => '',
+                'description' => __('Required for Transactions/Charge API. Find in your PayPlus account.', 'payplus-payment-gateway'),
+                'desc_tip'    => true,
+            ],
+            // ── End Subscription Installments ──────────────────────
             'logging' => [
                 'title' => __('Logging', 'payplus-payment-gateway'),
                 'type' => 'checkbox',
