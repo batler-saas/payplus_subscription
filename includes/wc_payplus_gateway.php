@@ -4360,16 +4360,19 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         $this->payplus_add_log_all($handle, "Order $order_id: num_payments=$num_payments first=$first_amount nonfirst=$nonfirst_amount");
 
-        // Get customer_uid from parent order's payplus_response
+        // Get customer_uid — try subscription meta first (editable by admin), then parent order response
         $customer_uid = '';
-        if ($parent_order_id) {
+        if ($subscription_id) {
+            $customer_uid = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_customer_uid', true);
+        }
+        if (empty($customer_uid) && $parent_order_id) {
             $parent_response = WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_response', true);
             if (!empty($parent_response)) {
                 $parent_data = json_decode($parent_response, true);
                 $customer_uid = $parent_data['customer_uid'] ?? '';
             }
         }
-        // Fallback: try subscription meta
+        // Fallback: try subscription response JSON
         if (empty($customer_uid) && $subscription_id) {
             $sub_response = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_response', true);
             if (!empty($sub_response)) {

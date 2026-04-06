@@ -103,6 +103,8 @@ class WC_PayPlus_Admin_Payments extends WC_PayPlus_Gateway
         add_action('woocommerce_order_actions_end', [$this, 'make_payment_button'], 10, 1);
         // process make payment
         add_action('save_post_shop_order', [$this, 'process_make_payment'], 10, 1);
+        // save subscription payment method fields
+        add_action('save_post_shop_subscription', [$this, 'save_subscription_payment_meta'], 10, 1);
         // admin notices
         add_action('admin_notices', [$this, 'admin_notices'], 15);
         add_action('wp_ajax_payplus-token-payment', [$this, 'ajax_payplus_token_payment']);
@@ -260,6 +262,18 @@ class WC_PayPlus_Admin_Payments extends WC_PayPlus_Gateway
                 'default', // Priority
                 ['metaBoxType' => 'payplusButtons'] // Custom argument for the callback
             );
+
+            // Editable payment method metabox — subscriptions only, admins only
+            if ($screen->post_type === 'shop_subscription' && current_user_can('manage_options')) {
+                add_meta_box(
+                    'payplus_subscription_payment_meta',
+                    "<img style='height: 35px;' src='" . PAYPLUS_PLUGIN_URL_ASSETS_IMAGES . "PayPlusLogo.svg'> " . __('Payment Method', 'payplus-payment-gateway'),
+                    [$this, 'display_subscription_payment_metabox'],
+                    $screen->id,
+                    'side',
+                    'default'
+                );
+            }
         }
     }
 
@@ -343,6 +357,117 @@ class WC_PayPlus_Admin_Payments extends WC_PayPlus_Gateway
         WC_PayPlus_Statics::payPlusOrderMetaBox($post, $metaBox);
     }
 
+    /**
+     * Editable payment method metabox for subscriptions (admin only).
+     */
+    public function display_subscription_payment_metabox($post)
+    {
+        $sub_id = property_exists($post, 'id') ? $post->get_id() : $post->ID;
+
+        // Try subscription meta first, then parent order
+        $source_id = $sub_id;
+        $customer_uid = '';
+        $token = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_token_uid', true);
+        $response_json = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_response', true);
+
+        if (empty($response_json)) {
+            $parent_id = wp_get_post_parent_id($sub_id);
+            if ($parent_id) {
+                $source_id = $parent_id;
+                $response_json = WC_PayPlus_Meta_Data::get_meta($parent_id, 'payplus_response', true);
+                if (empty($token)) {
+                    $token = WC_PayPlus_Meta_Data::get_meta($parent_id, 'payplus_token_uid', true);
+                }
+            }
+        }
+
+        $four_digits = WC_PayPlus_Meta_Data::get_meta($source_id, 'payplus_four_digits', true);
+        $brand_name = WC_PayPlus_Meta_Data::get_meta($source_id, 'payplus_brand_name', true);
+        $expiry_month = '';
+        $expiry_year = '';
+
+        // Extract from response JSON
+        if (!empty($response_json)) {
+            $data = json_decode($response_json, true);
+            if (is_array($data)) {
+                $customer_uid = $data['customer_uid'] ?? '';
+                if (empty($four_digits)) $four_digits = $data['four_digits'] ?? $data['data']['data']['card_information']['four_digits'] ?? '';
+                if (empty($brand_name)) $brand_name = $data['brand_name'] ?? '';
+                $expiry_month = $data['expiry_month'] ?? $data['data']['data']['card_information']['expiry_month'] ?? '';
+                $expiry_year = $data['expiry_year'] ?? $data['data']['data']['card_information']['expiry_year'] ?? '';
+                if (empty($token)) $token = $data['token_uid'] ?? $data['data']['data']['card_information']['token'] ?? '';
+            }
+        }
+
+        // Override with directly saved subscription meta if available
+        $sub_customer_uid = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_customer_uid', true);
+        if (!empty($sub_customer_uid)) $customer_uid = $sub_customer_uid;
+        $sub_four = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_four_digits', true);
+        if (!empty($sub_four)) $four_digits = $sub_four;
+        $sub_brand = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_brand_name', true);
+        if (!empty($sub_brand)) $brand_name = $sub_brand;
+        $sub_exp_m = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_expiry_month', true);
+        if (!empty($sub_exp_m)) $expiry_month = $sub_exp_m;
+        $sub_exp_y = WC_PayPlus_Meta_Data::get_meta($sub_id, 'payplus_expiry_year', true);
+        if (!empty($sub_exp_y)) $expiry_year = $sub_exp_y;
+
+        wp_nonce_field('payplus_sub_payment_meta', 'payplus_sub_payment_nonce');
+
+        $fields = [
+            'payplus_sub_customer_uid' => [__('Customer UID', 'payplus-payment-gateway'), $customer_uid],
+            'payplus_sub_token'        => [__('Token', 'payplus-payment-gateway'), $token],
+            'payplus_sub_four_digits'  => [__('Last 4 Digits', 'payplus-payment-gateway'), $four_digits],
+            'payplus_sub_brand_name'   => [__('Brand', 'payplus-payment-gateway'), $brand_name],
+            'payplus_sub_expiry_month' => [__('Expiry Month', 'payplus-payment-gateway'), $expiry_month],
+            'payplus_sub_expiry_year'  => [__('Expiry Year', 'payplus-payment-gateway'), $expiry_year],
+        ];
+
+        echo '<table style="width:100%;border-collapse:collapse;">';
+        foreach ($fields as $name => $field) {
+            echo '<tr style="border-bottom:1px solid #ddd;">';
+            echo '<td style="padding:4px 0;font-weight:600;vertical-align:top;white-space:nowrap;">' . esc_html($field[0]) . '</td>';
+            echo '<td style="padding:4px 0;"><input type="text" name="' . esc_attr($name) . '" value="' . esc_attr($field[1]) . '" style="width:100%;font-size:11px;" /></td>';
+            echo '</tr>';
+        }
+        echo '</table>';
+        echo '<p style="color:#666;font-size:11px;margin-top:8px;">' . esc_html__('Editable by administrators only. Changes saved with the subscription.', 'payplus-payment-gateway') . '</p>';
+    }
+
+    /**
+     * Save subscription payment method meta fields.
+     */
+    public function save_subscription_payment_meta($post_id)
+    {
+        if (!current_user_can('manage_options')) return;
+        if (!isset($_POST['payplus_sub_payment_nonce']) || !wp_verify_nonce($_POST['payplus_sub_payment_nonce'], 'payplus_sub_payment_meta')) return;
+        if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+
+        $fields = [
+            'payplus_sub_customer_uid' => 'payplus_customer_uid',
+            'payplus_sub_token'        => 'payplus_token_uid',
+            'payplus_sub_four_digits'  => 'payplus_four_digits',
+            'payplus_sub_brand_name'   => 'payplus_brand_name',
+            'payplus_sub_expiry_month' => 'payplus_expiry_month',
+            'payplus_sub_expiry_year'  => 'payplus_expiry_year',
+        ];
+
+        foreach ($fields as $post_key => $meta_key) {
+            if (isset($_POST[$post_key])) {
+                update_post_meta($post_id, $meta_key, sanitize_text_field(wp_unslash($_POST[$post_key])));
+            }
+        }
+
+        // Also update cc_token on the user if token was changed
+        if (!empty($_POST['payplus_sub_token'])) {
+            $subscription = wcs_get_subscription($post_id);
+            if ($subscription) {
+                $user_id = $subscription->get_user_id();
+                if ($user_id) {
+                    update_user_meta($user_id, 'cc_token', sanitize_text_field(wp_unslash($_POST['payplus_sub_token'])));
+                }
+            }
+        }
+    }
 
     public function isInitiated()
     {
