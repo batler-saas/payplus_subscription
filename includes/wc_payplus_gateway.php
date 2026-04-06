@@ -4360,16 +4360,19 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         $this->payplus_add_log_all($handle, "Order $order_id: num_payments=$num_payments first=$first_amount nonfirst=$nonfirst_amount");
 
-        // Get customer_uid from parent order's payplus_response
+        // Get customer_uid — try subscription meta first (editable by admin), then parent order response
         $customer_uid = '';
-        if ($parent_order_id) {
+        if ($subscription_id) {
+            $customer_uid = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_customer_uid', true);
+        }
+        if (empty($customer_uid) && $parent_order_id) {
             $parent_response = WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_response', true);
             if (!empty($parent_response)) {
                 $parent_data = json_decode($parent_response, true);
                 $customer_uid = $parent_data['customer_uid'] ?? '';
             }
         }
-        // Fallback: try subscription meta
+        // Fallback: try subscription response JSON
         if (empty($customer_uid) && $subscription_id) {
             $sub_response = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_response', true);
             if (!empty($sub_response)) {
@@ -4496,17 +4499,17 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         }
 
         $res         = json_decode(wp_remote_retrieve_body($response));
-        $status      = $res->data->status          ?? '';
-        $status_code = $res->data->status_code     ?? '';
-        $txn_uid     = $res->data->transaction_uid ?? '';
-        $txn_number  = $res->data->number          ?? '';
+        $status      = $res->results->status                ?? '';
+        $status_code = $res->data->transaction->status_code ?? '';
+        $txn_uid     = $res->data->transaction->uid         ?? '';
+        $txn_number  = $res->data->transaction->number      ?? '';
 
         $this->payplus_add_log_all($handle, "Order $order_id: status=$status code=$status_code txn=$txn_uid");
 
-        if ($status === 'approved' && $status_code === '000' && $txn_uid) {
+        if ($status === 'success' && $status_code === '000' && $txn_uid) {
 
             WC_PayPlus_Meta_Data::update_meta($order, [
-                'payplus_type'                 => $res->data->type ?? 'Charge',
+                'payplus_type'                 => $res->data->transaction->type ?? 'Charge',
                 'payplus_method'               => 'credit-card',
                 'payplus_response'             => wp_json_encode($res->data),
                 'payplus_transaction_uid'      => $txn_uid,
@@ -4523,13 +4526,12 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 $txn_number, $num_payments
             ));
 
+            $order->payment_complete($txn_uid);
+
             if ($this->recurring_order_set_to_paid === 'yes') {
-                $order->payment_complete();
                 $order->update_status('completed');
             } elseif ($this->successful_order_status !== 'default-woo') {
                 $order->update_status($this->successful_order_status);
-            } else {
-                $order->update_status('wc-processing');
             }
 
             $this->payplus_add_log_all($handle, "Order $order_id: SUCCESS txn=$txn_uid payments=$num_payments", 'completed');

@@ -249,7 +249,18 @@ class WC_PayPlus_Statics
                 }
                 if ($boxType === 'payplus') {
                     $responsePayPlus = WC_PayPlus_Meta_Data::get_meta($order_id, 'payplus_response', true);
-                    $manualOrderPayments = WC_PayPlus_Meta_Data::get_meta($order_id, 'payplus_order_payments', true) ? json_decode(WC_PayPlus_Meta_Data::get_meta($order_id, 'payplus_order_payments', true), true) : false;
+
+                    // For subscriptions: fall back to parent order data
+                    $meta_source_id = $order_id;
+                    if (empty($responsePayPlus)) {
+                        $parent_id = wp_get_post_parent_id($order_id);
+                        if ($parent_id) {
+                            $responsePayPlus = WC_PayPlus_Meta_Data::get_meta($parent_id, 'payplus_response', true);
+                            $meta_source_id = $parent_id;
+                        }
+                    }
+
+                    $manualOrderPayments = WC_PayPlus_Meta_Data::get_meta($meta_source_id, 'payplus_order_payments', true) ? json_decode(WC_PayPlus_Meta_Data::get_meta($meta_source_id, 'payplus_order_payments', true), true) : false;
                     $responseArray = json_decode($responsePayPlus, true);
                     if (!empty($responsePayPlus) && json_last_error() !== JSON_ERROR_NONE) {
                         $error_message = json_last_error_msg();
@@ -260,7 +271,7 @@ class WC_PayPlus_Statics
                         $responseArray = json_decode($fixedJson, true);
                     }
                     if (isset($responseArray) && is_array($responseArray)) {
-                        $payPlusType = WC_PayPlus_Meta_Data::get_meta($order_id, 'payplus_type', true);
+                        $payPlusType = WC_PayPlus_Meta_Data::get_meta($meta_source_id, 'payplus_type', true);
                         $totalAmount = $responseArray['amount'] ?? $responseArray['data']['transaction']['amount'];
                         if (!is_null($totalAmount)) {
                             if (!isset($responseArray['related_transactions'])) {
@@ -284,7 +295,7 @@ class WC_PayPlus_Statics
                                 $status = $status === "approved" ? "Approved" : $status;
                                 $status = isset($responseArray['data']['transaction']['approval_number']) ? "Approved" : $status;
                                 $tokeUid = $responseArray['token_uid'] ?? $responseArray['data']['data']['card_information']['token_number'] ?? null;
-                                $j5Charge = WC_PayPlus_Meta_Data::get_meta($order_id, 'payplus_charged_j5_amount') ?? null;
+                                $j5Charge = WC_PayPlus_Meta_Data::get_meta($meta_source_id, 'payplus_charged_j5_amount') ?? null;
                                 $identificationNumber = $responseArray['identification_number'] ?? $responseArray['data']['transaction']['identification_number'] ?? null;
                                 echo wp_kses_post(WC_PayPlus_Statics::createPayPlusDataBox($statusCode, $status, $amount, $method, $brand, $issuer, $type, $number, $fourDigits, $expMonth, $expYear, $numOfPayments, $voucherNum, $approvalNum, $tokeUid, $j5Charge, $date, false, $identificationNumber));
                             } else {
