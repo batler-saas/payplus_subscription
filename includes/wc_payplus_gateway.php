@@ -4360,6 +4360,25 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         $this->payplus_add_log_all($handle, "Order $order_id: num_payments=$num_payments first=$first_amount nonfirst=$nonfirst_amount");
 
+        // Get customer_uid from parent order's payplus_response
+        $customer_uid = '';
+        if ($parent_order_id) {
+            $parent_response = WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_response', true);
+            if (!empty($parent_response)) {
+                $parent_data = json_decode($parent_response, true);
+                $customer_uid = $parent_data['customer_uid'] ?? '';
+            }
+        }
+        // Fallback: try subscription meta
+        if (empty($customer_uid) && $subscription_id) {
+            $sub_response = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_response', true);
+            if (!empty($sub_response)) {
+                $sub_data = json_decode($sub_response, true);
+                $customer_uid = $sub_data['customer_uid'] ?? '';
+            }
+        }
+        $this->payplus_add_log_all($handle, "Order $order_id: customer_uid=$customer_uid");
+
         // No installments — fall back to single charge via receipt_page
         if ($num_payments <= 1) {
             $this->payplus_add_log_all($handle, "Order $order_id: no installments, falling back to single charge.");
@@ -4373,10 +4392,74 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
             $nonfirst_amount = $per;
         }
 
+        // Build products array from order items
+        $products = [];
+        $wc_tax_enabled = wc_tax_enabled();
+        $isTaxIncluded = wc_prices_include_tax();
+
+        foreach ($order->get_items(['line_item', 'fee']) as $item_data) {
+            if ($item_data['type'] === 'fee') {
+                $itemPrice = round($item_data['line_total'], 2);
+            } else {
+                $itemPrice = round($order->get_item_subtotal($item_data, $wc_tax_enabled), 2);
+            }
+            $name = str_replace(["'", '"', "\n", "\\"], '', wp_strip_all_tags($item_data['name']));
+            $quantity = $item_data['quantity'] ? round($item_data['quantity'], 2) : 1;
+
+            $product_item = [
+                'name'     => $name,
+                'quantity' => (string) $quantity,
+                'price'    => (string) $itemPrice,
+            ];
+
+            // Add barcode (SKU or product ID)
+            if ($item_data['type'] !== 'fee' && !empty($item_data['product_id'])) {
+                $product = new WC_Product($item_data['product_id']);
+                $productSKU = $product->get_sku() ?: $item_data['product_id'];
+                $product_item['barcode'] = (string) $productSKU;
+
+                // VAT type
+                if ($wc_tax_enabled) {
+                    $product_item['vat_type'] = $isTaxIncluded && $product->get_tax_status() === 'taxable' ? 0 : 1;
+                    if ($product->get_tax_status() === 'none') $product_item['vat_type'] = 2;
+                } else {
+                    $product_item['vat_type'] = 0;
+                }
+
+                // Product image
+                $productImageData = wp_get_attachment_image_src($product->get_image_id(), 'full');
+                if ($productImageData && isset($productImageData[0])) {
+                    $product_item['image_url'] = $productImageData[0];
+                }
+            }
+
+            if ($itemPrice) {
+                $products[] = $product_item;
+            }
+        }
+
+        // Add shipping
+        foreach ($order->get_shipping_methods() as $shipping_method) {
+            $shipping_data = $shipping_method->get_data();
+            $shipping_total = $order->get_shipping_total();
+            if ($wc_tax_enabled) {
+                $shipping_total += $order->get_shipping_tax();
+            }
+            $shipping_total = round($shipping_total, 2);
+            if ($shipping_total > 0) {
+                $products[] = [
+                    'name'     => __('Shipping', 'payplus-payment-gateway') . ' - ' . str_replace(["'", '"', "\\"], '', $shipping_data['name']),
+                    'quantity' => '1',
+                    'price'    => (string) $shipping_total,
+                ];
+            }
+        }
+
         // Build payload
         $payload = [
             'terminal_uid'  => $this->subscription_terminal_uid,
             'cashier_uid'   => $this->subscription_cashier_uid,
+            'customer_uid'  => $customer_uid,
             'amount'        => $amount_to_charge,
             'currency_code' => $order->get_currency() ?: 'ILS',
             'credit_terms'  => 8,
@@ -4390,6 +4473,11 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 'nonfirst_amount' => $nonfirst_amount,
             ],
         ];
+
+        // Add products if available
+        if (!empty($products)) {
+            $payload['products'] = $products;
+        }
 
         // Save payload as order meta for admin visibility
         WC_PayPlus_Meta_Data::update_meta($order, [
