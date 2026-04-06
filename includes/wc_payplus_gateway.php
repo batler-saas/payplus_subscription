@@ -4440,6 +4440,16 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         if ($status === 'success' && $status_code === '000' && $txn_uid) {
 
+            // Extract card details from response for invoice generation
+            $four_digits  = $res->data->data->card_information->four_digits ?? '';
+            $brand_id     = $res->data->data->card_information->brand_id ?? '';
+            $issuer_id    = $res->data->data->card_information->issuer_id ?? '';
+            $expiry_month = $res->data->data->card_information->expiry_month ?? '';
+            $expiry_year  = $res->data->data->card_information->expiry_year ?? '';
+            $credit_terms = $res->data->transaction->credit_terms ?? 'payments';
+            $voucher_num  = $res->data->transaction->voucher_number ?? '';
+            $approval_num = $res->data->transaction->approval_number ?? '';
+
             WC_PayPlus_Meta_Data::update_meta($order, [
                 'payplus_type'                 => $res->data->transaction->type ?? 'Charge',
                 'payplus_method'               => 'credit-card',
@@ -4450,6 +4460,19 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 'payplus_first_payment_amount' => $first_amount,
                 'payplus_rest_payments_amount' => $nonfirst_amount,
                 'payplus_credit-card'          => $amount_to_charge,
+                'payplus_four_digits'          => $four_digits,
+                'payplus_brand_name'           => $brand_id,
+                'payplus_issuer_id'            => $issuer_id,
+                'payplus_expiry_month'         => $expiry_month,
+                'payplus_expiry_year'          => $expiry_year,
+                'payplus_credit_terms'         => $credit_terms,
+                'payplus_voucher_num'          => $voucher_num,
+                'payplus_approval_num'         => $approval_num,
+                'payplus_number'               => $txn_number,
+                'payplus_token_uid'            => $token,
+                'payplus_currency'             => $order->get_currency() ?: 'ILS',
+                'payplus_status'               => 'approved',
+                'payplus_status_code'          => $status_code,
             ]);
             delete_post_meta($order_id, 'payplus_error_sub');
 
@@ -4457,6 +4480,14 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 __('PayPlus Installment Renewal Successful<br/>Transaction: %1$s | Payments: %2$d', 'payplus-payment-gateway'),
                 $txn_number, $num_payments
             ));
+
+            // Prevent duplicate invoice: remove the automatic invoice hook before status change.
+            // The standard invoice hook (payplus_invoice_create_order) will handle it correctly.
+            $wc_payplus = WC_PayPlus::get_instance();
+            if (isset($wc_payplus->invoice_api) && $wc_payplus->invoice_api) {
+                remove_action('woocommerce_order_status_processing', [$wc_payplus->invoice_api, 'payplus_invoice_create_order_automatic']);
+                remove_action('woocommerce_order_status_on-hold', [$wc_payplus->invoice_api, 'payplus_invoice_create_order_automatic']);
+            }
 
             $order->payment_complete($txn_uid);
 
