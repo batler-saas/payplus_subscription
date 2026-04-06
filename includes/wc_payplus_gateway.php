@@ -4360,6 +4360,25 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         $this->payplus_add_log_all($handle, "Order $order_id: num_payments=$num_payments first=$first_amount nonfirst=$nonfirst_amount");
 
+        // Get customer_uid from parent order's payplus_response
+        $customer_uid = '';
+        if ($parent_order_id) {
+            $parent_response = WC_PayPlus_Meta_Data::get_meta($parent_order_id, 'payplus_response', true);
+            if (!empty($parent_response)) {
+                $parent_data = json_decode($parent_response, true);
+                $customer_uid = $parent_data['customer_uid'] ?? '';
+            }
+        }
+        // Fallback: try subscription meta
+        if (empty($customer_uid) && $subscription_id) {
+            $sub_response = WC_PayPlus_Meta_Data::get_meta($subscription_id, 'payplus_response', true);
+            if (!empty($sub_response)) {
+                $sub_data = json_decode($sub_response, true);
+                $customer_uid = $sub_data['customer_uid'] ?? '';
+            }
+        }
+        $this->payplus_add_log_all($handle, "Order $order_id: customer_uid=$customer_uid");
+
         // No installments — fall back to single charge via receipt_page
         if ($num_payments <= 1) {
             $this->payplus_add_log_all($handle, "Order $order_id: no installments, falling back to single charge.");
@@ -4377,6 +4396,7 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         $payload = [
             'terminal_uid'  => $this->subscription_terminal_uid,
             'cashier_uid'   => $this->subscription_cashier_uid,
+            'customer_uid'  => $customer_uid,
             'amount'        => $amount_to_charge,
             'currency_code' => $order->get_currency() ?: 'ILS',
             'credit_terms'  => 8,
