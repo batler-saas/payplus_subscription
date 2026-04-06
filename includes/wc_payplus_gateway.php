@@ -4523,13 +4523,12 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
                 $txn_number, $num_payments
             ));
 
+            $order->payment_complete($txn_uid);
+
             if ($this->recurring_order_set_to_paid === 'yes') {
-                $order->payment_complete();
                 $order->update_status('completed');
             } elseif ($this->successful_order_status !== 'default-woo') {
                 $order->update_status($this->successful_order_status);
-            } else {
-                $order->update_status('wc-processing');
             }
 
             $this->payplus_add_log_all($handle, "Order $order_id: SUCCESS txn=$txn_uid payments=$num_payments", 'completed');
