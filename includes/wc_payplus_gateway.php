@@ -4496,17 +4496,17 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
         }
 
         $res         = json_decode(wp_remote_retrieve_body($response));
-        $status      = $res->data->status          ?? '';
-        $status_code = $res->data->status_code     ?? '';
-        $txn_uid     = $res->data->transaction_uid ?? '';
-        $txn_number  = $res->data->number          ?? '';
+        $status      = $res->results->status                ?? '';
+        $status_code = $res->data->transaction->status_code ?? '';
+        $txn_uid     = $res->data->transaction->uid         ?? '';
+        $txn_number  = $res->data->transaction->number      ?? '';
 
         $this->payplus_add_log_all($handle, "Order $order_id: status=$status code=$status_code txn=$txn_uid");
 
-        if ($status === 'approved' && $status_code === '000' && $txn_uid) {
+        if ($status === 'success' && $status_code === '000' && $txn_uid) {
 
             WC_PayPlus_Meta_Data::update_meta($order, [
-                'payplus_type'                 => $res->data->type ?? 'Charge',
+                'payplus_type'                 => $res->data->transaction->type ?? 'Charge',
                 'payplus_method'               => 'credit-card',
                 'payplus_response'             => wp_json_encode($res->data),
                 'payplus_transaction_uid'      => $txn_uid,
