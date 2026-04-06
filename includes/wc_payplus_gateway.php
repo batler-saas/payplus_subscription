@@ -4397,17 +4397,18 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
 
         // Build payload
         $payload = [
-            'terminal_uid'  => $this->subscription_terminal_uid,
-            'cashier_uid'   => $this->subscription_cashier_uid,
-            'customer_uid'  => $customer_uid,
-            'amount'        => $amount_to_charge,
-            'currency_code' => $order->get_currency() ?: 'ILS',
-            'credit_terms'  => 8,
-            'use_token'     => true,
-            'token'         => $token,
-            'more_info_1'   => (string) $order_id,
-            'more_info_4'   => PAYPLUS_VERSION,
-            'payments'      => [
+            'terminal_uid'    => $this->subscription_terminal_uid,
+            'cashier_uid'     => $this->subscription_cashier_uid,
+            'customer_uid'    => $customer_uid,
+            'amount'          => $amount_to_charge,
+            'currency_code'   => $order->get_currency() ?: 'ILS',
+            'credit_terms'    => 8,
+            'use_token'       => true,
+            'token'           => $token,
+            'more_info_1'     => (string) $order_id,
+            'more_info_4'     => PAYPLUS_VERSION,
+            'initial_invoice' => false,
+            'payments'        => [
                 'number'          => $num_payments,
                 'first_amount'    => $first_amount,
                 'nonfirst_amount' => $nonfirst_amount,
@@ -4450,10 +4451,24 @@ class WC_PayPlus_Gateway extends WC_Payment_Gateway_CC
             $voucher_num  = $res->data->transaction->voucher_number ?? '';
             $approval_num = $res->data->transaction->approval_number ?? '';
 
+            // Build a flattened response for invoice compatibility
+            // The invoice code (wc_payplus_invoice.php:1345-1349) expects top-level fields
+            $flat_response = (array) $res->data;
+            $flat_response['number_of_payments']   = $num_payments;
+            $flat_response['first_payment_amount']  = $first_amount;
+            $flat_response['rest_payments_amount']  = $nonfirst_amount;
+            $flat_response['four_digits']           = $four_digits;
+            $flat_response['brand_name']            = $brand_id;
+            $flat_response['method']                = 'credit-card';
+            $flat_response['amount']                = $amount_to_charge;
+            $flat_response['status']                = 'approved';
+            $flat_response['status_code']           = $status_code;
+            $flat_response['credit_terms']          = $credit_terms;
+
             WC_PayPlus_Meta_Data::update_meta($order, [
                 'payplus_type'                 => $res->data->transaction->type ?? 'Charge',
                 'payplus_method'               => 'credit-card',
-                'payplus_response'             => wp_json_encode($res->data),
+                'payplus_response'             => wp_json_encode($flat_response),
                 'payplus_transaction_uid'      => $txn_uid,
                 'payplus_status_active'        => 1,
                 'payplus_number_of_payments'   => $num_payments,
